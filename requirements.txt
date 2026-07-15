@@ -5,7 +5,7 @@ numpy
 scikit-learn
 dtaidistance
 plotly
-pandas_ta
+pandas-ta-openbb
 psycopg2-binary
 python-dotenv
 supabase
