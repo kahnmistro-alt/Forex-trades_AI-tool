@@ -1,0 +1,580 @@
+/* ------------------------------
+   TRADER'S HOME – RESPONSIVE
+   Mobile & Desktop Optimised
+------------------------------ */
+
+:root {
+    --bg-primary: #0a0c12;
+    --bg-secondary: #13161f;
+    --card-bg: #1a1f2b;
+    --border: #2a2f3c;
+    --text-primary: #edf2f7;
+    --text-secondary: #a0aec0;
+    --accent-blue: #3b82f6;
+    --accent-green: #10b981;
+    --accent-red: #ef4444;
+    --accent-hold: #6c757d;
+    --shadow: 0 8px 20px rgba(0, 0, 0, 0.3);
+}
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    background: var(--bg-primary);
+    font-family: 'Inter', 'Segoe UI', system-ui, -apple-system, sans-serif;
+    color: var(--text-primary);
+    line-height: 1.5;
+    padding: 0.8rem;
+}
+
+.app-container {
+    max-width: 1600px;
+    margin: 0 auto;
+}
+
+
+/* ----- Navbar (responsive) ----- */
+
+.navbar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: var(--bg-secondary);
+    padding: 0.75rem 1.2rem;
+    border-radius: 1.5rem;
+    margin-bottom: 1.5rem;
+    border: 1px solid var(--border);
+    flex-wrap: wrap;
+    gap: 0.8rem;
+}
+
+.logo {
+    font-size: 1.3rem;
+    font-weight: 700;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.logo i {
+    font-size: 1.4rem;
+    color: var(--accent-blue);
+}
+
+.nav-links {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    flex-wrap: wrap;
+}
+
+.badge-live {
+    background: rgba(16, 185, 129, 0.2);
+    color: #10b981;
+    padding: 0.3rem 0.8rem;
+    border-radius: 2rem;
+    font-size: 0.75rem;
+    font-weight: 600;
+}
+
+.time-display {
+    font-size: 0.75rem;
+    background: var(--card-bg);
+    padding: 0.3rem 0.8rem;
+    border-radius: 2rem;
+}
+
+
+/* ----- Dashboard Grid (mobile first) ----- */
+
+.dashboard {
+    display: flex;
+    flex-direction: column;
+    gap: 1.5rem;
+}
+
+
+/* On desktop: two columns */
+
+@media (min-width: 768px) {
+    .dashboard {
+        display: grid;
+        grid-template-columns: 320px 1fr;
+        gap: 1.8rem;
+    }
+}
+
+
+/* Settings Card – full width on mobile */
+
+.settings-card {
+    background: var(--card-bg);
+    border-radius: 1.5rem;
+    padding: 1.2rem;
+    border: 1px solid var(--border);
+    box-shadow: var(--shadow);
+}
+
+@media (min-width: 768px) {
+    .settings-card {
+        position: sticky;
+        top: 1rem;
+        height: fit-content;
+        padding: 1.5rem;
+    }
+}
+
+.settings-card h3 {
+    font-size: 1.2rem;
+    margin-bottom: 1.2rem;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    color: var(--accent-blue);
+}
+
+.settings-group {
+    margin-bottom: 1.2rem;
+}
+
+.settings-group label {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.85rem;
+    font-weight: 500;
+    margin-bottom: 0.5rem;
+    color: var(--text-secondary);
+}
+
+.settings-group textarea,
+.settings-group select {
+    width: 100%;
+    background: #0f1219;
+    border: 1px solid var(--border);
+    border-radius: 0.75rem;
+    padding: 0.7rem;
+    color: var(--text-primary);
+    font-size: 0.9rem;
+    font-family: inherit;
+}
+
+.slider-container {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+}
+
+.slider-container input {
+    flex: 1;
+    height: 5px;
+    -webkit-appearance: none;
+    background: var(--border);
+    border-radius: 3px;
+}
+
+.slider-container input::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 18px;
+    height: 18px;
+    background: var(--accent-blue);
+    border-radius: 50%;
+    cursor: pointer;
+}
+
+.slider-container span {
+    background: var(--bg-primary);
+    padding: 0.2rem 0.7rem;
+    border-radius: 1rem;
+    font-size: 0.9rem;
+    font-weight: 600;
+    min-width: 3rem;
+    text-align: center;
+}
+
+.btn-primary {
+    background: var(--accent-blue);
+    border: none;
+    width: 100%;
+    padding: 0.8rem;
+    border-radius: 2rem;
+    font-weight: 600;
+    font-size: 1rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    cursor: pointer;
+    margin-top: 0.5rem;
+    transition: 0.2s;
+    color: white;
+}
+
+.btn-primary:active {
+    transform: scale(0.97);
+}
+
+.info-note {
+    margin-top: 1.2rem;
+    font-size: 0.7rem;
+    color: var(--text-secondary);
+    text-align: center;
+    display: flex;
+    justify-content: center;
+    gap: 0.4rem;
+}
+
+
+/* Main content */
+
+.main-content {
+    min-width: 0;
+    /* Helps with overflow */
+}
+
+.loading-card,
+.error-card {
+    background: var(--card-bg);
+    border-radius: 1.2rem;
+    padding: 1.5rem;
+    text-align: center;
+    margin-bottom: 1.2rem;
+}
+
+.error-card {
+    background: rgba(239, 68, 68, 0.1);
+    border: 1px solid var(--accent-red);
+    color: #fca5a5;
+}
+
+.hidden {
+    display: none;
+}
+
+
+/* Section titles */
+
+.summary-section h2,
+.actionable-section h2,
+.charts-section h2 {
+    font-size: 1.2rem;
+    margin: 1.2rem 0 0.8rem 0;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+
+/* ------------------------------
+   TABLE – horizontal scroll on mobile
+------------------------------ */
+
+.signal-table {
+    width: 100%;
+    background: var(--card-bg);
+    border-radius: 1rem;
+    overflow-x: auto;
+    display: block;
+    white-space: nowrap;
+    font-size: 0.8rem;
+}
+
+.signal-table table {
+    width: 100%;
+    border-collapse: collapse;
+}
+
+.signal-table th,
+.signal-table td {
+    padding: 0.7rem 0.8rem;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+}
+
+.signal-table th {
+    background: rgba(59, 130, 246, 0.15);
+    font-weight: 600;
+}
+
+
+/* Signal badges */
+
+.signal-BUY,
+.signal-SELL,
+.signal-HOLD {
+    display: inline-block;
+    padding: 0.2rem 0.7rem;
+    border-radius: 2rem;
+    font-weight: 700;
+    font-size: 0.7rem;
+    white-space: nowrap;
+}
+
+.signal-BUY {
+    background: rgba(16, 185, 129, 0.2);
+    color: #34d399;
+}
+
+.signal-SELL {
+    background: rgba(239, 68, 68, 0.2);
+    color: #f87171;
+}
+
+.signal-HOLD {
+    background: rgba(108, 117, 125, 0.2);
+    color: #9ca3af;
+}
+
+.copy-btn {
+    background: #2d3748;
+    border: none;
+    color: white;
+    padding: 0.4rem 0.8rem;
+    border-radius: 2rem;
+    cursor: pointer;
+    font-size: 0.7rem;
+    transition: 0.1s;
+    white-space: nowrap;
+}
+
+.copy-btn:active {
+    background: #4a5568;
+}
+
+
+/* Actionable Cards (stack on mobile) */
+
+.actionable-section {
+    display: flex;
+    flex-direction: column;
+    gap: 0.8rem;
+}
+
+.trade-card {
+    background: linear-gradient(135deg, #1a1f2b 0%, #13161f 100%);
+    border-left: 6px solid var(--accent-blue);
+    border-radius: 1rem;
+    padding: 1rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.8rem;
+}
+
+@media (min-width: 640px) {
+    .trade-card {
+        flex-direction: row;
+        align-items: center;
+        justify-content: space-between;
+        padding: 1rem 1.5rem;
+    }
+}
+
+.trade-card-buy {
+    border-left-color: var(--accent-green);
+}
+
+.trade-card-sell {
+    border-left-color: var(--accent-red);
+}
+
+.trade-info {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+}
+
+.trade-pair {
+    font-size: 1.1rem;
+    font-weight: 700;
+}
+
+.trade-signal {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+}
+
+.trade-patterns {
+    font-size: 0.7rem;
+    color: var(--text-secondary);
+    background: #0f1219;
+    padding: 0.2rem 0.5rem;
+    border-radius: 0.5rem;
+    display: inline-block;
+    margin-top: 0.2rem;
+}
+
+.trade-levels {
+    font-family: monospace;
+    font-size: 0.8rem;
+    background: #0f1219;
+    padding: 0.4rem 0.7rem;
+    border-radius: 0.8rem;
+    word-break: break-all;
+}
+
+.trade-actions {
+    display: flex;
+    gap: 0.5rem;
+}
+
+.trade-actions .copy-btn {
+    padding: 0.5rem 1rem;
+    font-size: 0.8rem;
+}
+
+
+/* Expandable charts */
+
+.expandable {
+    background: var(--card-bg);
+    border-radius: 1rem;
+    margin-bottom: 1rem;
+    border: 1px solid var(--border);
+}
+
+.expandable-header {
+    padding: 0.8rem 1.2rem;
+    cursor: pointer;
+    font-weight: 600;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 0.9rem;
+}
+
+.expandable-header:active {
+    background: rgba(59, 130, 246, 0.1);
+}
+
+.expandable-content {
+    padding: 0 1rem 1rem 1rem;
+    display: none;
+}
+
+.expandable-content.show {
+    display: block;
+}
+
+.chart-container {
+    height: 300px;
+    width: 100%;
+}
+
+@media (min-width: 768px) {
+    .chart-container {
+        height: 420px;
+    }
+}
+
+
+/* Extra small screens */
+
+@media (max-width: 480px) {
+    body {
+        padding: 0.4rem;
+    }
+    .navbar {
+        padding: 0.5rem 1rem;
+    }
+    .logo {
+        font-size: 1.1rem;
+    }
+    .signal-table th,
+    .signal-table td {
+        padding: 0.5rem;
+        font-size: 0.7rem;
+    }
+    .btn-primary {
+        padding: 0.7rem;
+        font-size: 0.9rem;
+    }
+}
+
+
+/* Trade Now button */
+
+.trade-btn {
+    background: #10b981;
+    border: none;
+    color: white;
+    padding: 0.4rem 0.8rem;
+    border-radius: 2rem;
+    cursor: pointer;
+    font-size: 0.7rem;
+    white-space: nowrap;
+    transition: 0.2s;
+}
+
+.trade-btn:active {
+    transform: scale(0.95);
+}
+
+.trade-btn:hover {
+    background: #059669;
+}
+
+
+/* Toggle switch */
+
+.toggle-container {
+    display: flex;
+    align-items: center;
+}
+
+.toggle-switch {
+    position: relative;
+    display: inline-block;
+    width: 50px;
+    height: 28px;
+}
+
+.toggle-switch input {
+    opacity: 0;
+    width: 0;
+    height: 0;
+}
+
+.toggle-switch .slider {
+    position: absolute;
+    cursor: pointer;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background-color: #4b5563;
+    transition: .4s;
+    border-radius: 34px;
+}
+
+.toggle-switch .slider:before {
+    position: absolute;
+    content: "";
+    height: 20px;
+    width: 20px;
+    left: 4px;
+    bottom: 4px;
+    background-color: white;
+    transition: .4s;
+    border-radius: 50%;
+}
+
+.toggle-switch input:checked+.slider {
+    background-color: #10b981;
+}
+
+.toggle-switch input:checked+.slider:before {
+    transform: translateX(22px);
+}
+
+
+/* Disabled Trade Now button */
+
+.trade-btn-disabled {
+    background: #6b7280;
+    cursor: not-allowed;
+    opacity: 0.6;
+}

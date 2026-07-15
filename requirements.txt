@@ -1,0 +1,13 @@
+flask
+yfinance
+pandas
+numpy
+scikit-learn
+dtaidistance
+plotly
+pandas_ta
+psycopg2-binary
+python-dotenv
+supabase
+pytrader-api
+TA-Lib

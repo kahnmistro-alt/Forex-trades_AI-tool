@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+    <title>Pattern Trader | Live Forex Signals</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <script src="https://cdn.plot.ly/plotly-3.0.1.min.js" charset="utf-8"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Top Navigation Bar -->
+        <nav class="navbar">
+            <div class="logo">
+                <i class="fas fa-chart-line"></i> 
+                <span>Pattern<span class="accent">Trader</span></span>
+            </div>
+            <div class="nav-links">
+                <span class="badge-live"><i class="fas fa-circle"></i> LIVE</span>
+                <span class="time-display" id="serverTime"></span>
+            </div>
+        </nav>
+
+        <!-- Main Dashboard Grid -->
+        <div class="dashboard">
+            <!-- Settings Sidebar -->
+            <aside class="settings-card">
+                <h3><i class="fas fa-sliders-h"></i> Trading Console</h3>
+                <div class="settings-group">
+                    <label><i class="fas fa-currency-exchange"></i> Pairs (comma separated)</label>
+                    <textarea id="pairs" rows="3">EURUSD=X, AUDCHF=X, NZDCHF=X, GBPNZD=X, USDCAD=X</textarea>
+                </div>
+                <div class="settings-group">
+                    <label><i class="fas fa-chart-bar"></i> Data interval</label>
+                    <select id="interval">
+                        <option value="1h" selected>📊 1 Hour</option>
+                        <option value="1d">📈 Daily</option>
+                    </select>
+                </div>
+                <div class="settings-group">
+                    <label><i class="fas fa-waveform"></i> ATR Period</label>
+                    <div class="slider-container">
+                        <input type="range" id="atr_period" min="7" max="21" value="14" step="1">
+                        <span id="atr_value">14</span>
+                    </div>
+                </div>
+                <div class="settings-group">
+                    <label><i class="fas fa-exclamation-triangle"></i> Risk (ATR units)</label>
+                    <div class="slider-container">
+                        <input type="range" id="risk_mult" min="1.0" max="3.0" value="1.0" step="0.5">
+                        <span id="risk_value">1.0</span>
+                    </div>
+                </div>
+                <div class="settings-group">
+                    <label><i class="fas fa-weight-scale"></i> Volume (lots)</label>
+                    <input type="number" id="volumeInput" value="0.01" step="0.01" min="0.01" max="10" style="width:100%; background:#0f1219; border:1px solid var(--border); border-radius:0.75rem; padding:0.7rem; color:var(--text-primary);">
+                </div>
+                <!-- Auto-Trade Toggle -->
+                <div class="settings-group">
+                    <label><i class="fas fa-robot"></i> Auto-Trade</label>
+                    <div class="toggle-container">
+                        <label class="toggle-switch">
+                            <input type="checkbox" id="autoTradeToggle">
+                            <span class="slider"></span>
+                        </label>
+                        <span id="autoTradeStatus" style="font-size:0.8rem; color:var(--text-secondary); margin-left:0.5rem;">Disabled</span>
+                    </div>
+                </div>
+                <button id="refreshBtn" class="btn-primary"><i class="fas fa-sync-alt"></i> Refresh Signals</button>
+                <div class="info-note">
+                    <i class="fas fa-info-circle"></i> 3:1 Reward:Risk | Pattern-based detection
+                </div>
+                <div class="info-note" style="color:#f59e0b;">
+                    <i class="fas fa-info-circle"></i> Demo mode: only EURUSD, AUDCHF, NZDCHF, GBPNZD, USDCAD
+                </div>
+            </aside>
+
+            <!-- Main Content -->
+            <main class="main-content">
+                <div id="loading" class="loading-card hidden">
+                    <i class="fas fa-spinner fa-pulse"></i> Scanning for patterns...
+                </div>
+                <div id="errorMsg" class="error-card hidden"></div>
+
+                <div id="summary" class="summary-section"></div>
+                <div id="actionable" class="actionable-section"></div>
+                <div id="charts" class="charts-section"></div>
+            </main>
+        </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>
