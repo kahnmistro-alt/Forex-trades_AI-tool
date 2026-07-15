@@ -3,16 +3,21 @@ import pickle
 import base64
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
+from sklearn.svm import SVC
+from hmmlearn import hmm
 from datetime import datetime
+import warnings
+warnings.filterwarnings('ignore')
 
 class PatternModel:
     def __init__(self, supabase_client):
         self.supabase = supabase_client
-        self.model = None
         self.scaler = StandardScaler()
+        self.svm = None
+        self.hmm_model = None
+        self.n_states = 3
         self.feature_columns = [
             'open', 'high', 'low', 'close', 'volume',
             'open_prev_1', 'high_prev_1', 'low_prev_1', 'close_prev_1',
@@ -29,10 +34,15 @@ class PatternModel:
                 .limit(1) \
                 .execute()
             if resp.data:
-                blob_b64 = resp.data[0]['model_blob']
+                # resp.data is a list of rows
+                row = resp.data[0]
+                blob_b64 = row['model_blob']
                 blob = base64.b64decode(blob_b64)
-                self.model = pickle.loads(blob)
-                print("✅ ML model loaded from Supabase.")
+                data = pickle.loads(blob)
+                self.scaler = data['scaler']
+                self.svm = data['svm']
+                self.hmm_model = data['hmm']
+                print("✅ HMM+SVM model loaded from Supabase.")
                 return True
             else:
                 print("ℹ️ No existing ML model found. Will train on first data.")
@@ -42,18 +52,22 @@ class PatternModel:
             return False
 
     def save_model(self):
-        if self.model is None:
+        if self.svm is None or self.hmm_model is None:
             print("No model to save.")
             return False
         try:
-            blob = pickle.dumps(self.model)
+            save_data = {
+                'scaler': self.scaler,
+                'svm': self.svm,
+                'hmm': self.hmm_model
+            }
+            blob = pickle.dumps(save_data)
             blob_b64 = base64.b64encode(blob).decode('utf-8')
             data = {
                 'model_blob': blob_b64,
                 'created_at': datetime.now().isoformat(),
-                'version': '1.0'
+                'version': '3.0'
             }
-            # Insert without .execute() – the wrapper handles the request
             self.supabase.table('pattern_models').insert(data)
             print("✅ Model saved to Supabase.")
             return True
@@ -99,44 +113,76 @@ class PatternModel:
             else:
                 y = np.array(labels)[positions]
 
+        # Binary classification for SVM
         mask = y != 0
         X_bin = X[mask]
         y_bin = (y[mask] > 0).astype(int)
 
         if len(X_bin) < 20:
-            print("Not enough samples to train.")
+            print("Not enough samples to train SVM.")
             return False
 
+        self.scaler.fit(X_bin)
+        X_scaled = self.scaler.transform(X_bin)
+
         X_train, X_test, y_train, y_test = train_test_split(
-            X_bin, y_bin, test_size=0.2, random_state=42
+            X_scaled, y_bin, test_size=0.2, random_state=42
         )
 
-        self.scaler.fit(X_train)
-        X_train_scaled = self.scaler.transform(X_train)
-        X_test_scaled = self.scaler.transform(X_test)
+        svm = SVC(kernel='rbf', C=1.0, gamma='scale', probability=True, random_state=42)
+        svm.fit(X_train, y_train)
+        acc = svm.score(X_test, y_test)
+        print(f"✅ SVM trained with accuracy: {acc:.2f}")
 
-        clf = RandomForestClassifier(n_estimators=100, random_state=42)
-        clf.fit(X_train_scaled, y_train)
-        score = clf.score(X_test_scaled, y_test)
-        print(f"✅ Model trained with accuracy: {score:.2f}")
+        # HMM on full feature set (including neutral)
+        X_all_scaled = self.scaler.transform(X)
+        hmm_model = hmm.GaussianHMM(n_components=self.n_states, covariance_type='full',
+                                    n_iter=100, random_state=42)
+        hmm_model.fit(X_all_scaled)
+        print("✅ HMM trained.")
 
-        self.model = clf
+        self.svm = svm
+        self.hmm_model = hmm_model
         self.save_model()
         return True
 
     def predict_pattern(self, df):
-        if self.model is None:
+        if self.svm is None or self.hmm_model is None:
             return 'HOLD', 0.0
+
         X, idx = self.prepare_features(df)
         if X is None or len(X) == 0:
             return 'HOLD', 0.0
+
         last_X = X[-1].reshape(1, -1)
         last_X_scaled = self.scaler.transform(last_X)
-        prob = self.model.predict_proba(last_X_scaled)[0]
-        pred = self.model.predict(last_X_scaled)[0]
-        confidence = max(prob) if pred == 1 else 1 - max(prob)
+
+        svm_prob = self.svm.predict_proba(last_X_scaled)[0]
+        svm_pred = self.svm.predict(last_X_scaled)[0]
+        svm_conf = svm_prob[1] if svm_pred == 1 else svm_prob[0]
+
+        state_probs = self.hmm_model.predict_proba(last_X_scaled)[0]
+        dominant_state = np.argmax(state_probs)
+
+        # State 0 = downtrend, 1 = sideways, 2 = uptrend
+        if svm_pred == 1:  # BUY
+            if dominant_state == 2:
+                confidence = min(1.0, svm_conf + 0.15)
+            elif dominant_state == 0:
+                confidence = max(0.0, svm_conf - 0.15)
+            else:
+                confidence = svm_conf
+        else:  # SELL
+            if dominant_state == 0:
+                confidence = min(1.0, svm_conf + 0.15)
+            elif dominant_state == 2:
+                confidence = max(0.0, svm_conf - 0.15)
+            else:
+                confidence = svm_conf
+
         if confidence > 0.6:
-            signal = 'BUY' if pred == 1 else 'SELL'
+            signal = 'BUY' if svm_pred == 1 else 'SELL'
         else:
             signal = 'HOLD'
-        return signal, confidence
+
+        return signal, float(confidence)

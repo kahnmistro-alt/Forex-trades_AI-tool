@@ -30,13 +30,12 @@ PYTRADER_PORT = int(os.environ.get('PYTRADER_PORT', 1122))
 PYTRADER_AUTH_CODE = os.environ.get('PYTRADER_AUTH_CODE', 'None')
 TRADE_VOLUME = float(os.environ.get('TRADE_VOLUME', 0.01))
 
-# ---------- Supabase (direct REST) ----------
+# ---------- Supabase ----------
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
 if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
     raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set!")
 
-# Normalise URL: ensure it ends with /rest/v1/
 if not SUPABASE_URL.endswith('/'):
     SUPABASE_URL += '/'
 if 'rest/v1' not in SUPABASE_URL:
@@ -97,10 +96,9 @@ connection_attempt_interval = 60
 auto_trade_enabled = False
 auto_trade_thread = None
 auto_trade_lock = threading.Lock()
-auto_trade_pairs = ['EURUSD', 'AUDCHF', 'NZDCHF', 'GBPNZD', 'USDCAD']
+auto_trade_pairs = ['EURUSD', 'AUDCHF', 'NZDCHF', 'GBPNZD', 'USDCAD']  # Demo only
 
 # ---------- ML Model ----------
-# Supabase wrapper for PatternModel (using the same URL)
 class SupabaseClientWrapper:
     def __init__(self, supabase_url, service_key):
         self.base_url = supabase_url
@@ -133,7 +131,6 @@ class TableWrapper:
         return self
 
     def execute(self):
-        # Build URL and query
         url = self.client.base_url + self.table_name
         params = {}
         if self.select_fields != '*':
@@ -142,9 +139,6 @@ class TableWrapper:
             params['order'] = f'{self.order_by}.desc' if self.order_desc else f'{self.order_by}.asc'
         if self.limit_val:
             params['limit'] = self.limit_val
-        # Add any filters (simplified)
-        for key, value in self.filters.items():
-            params[key] = value
         headers = {
             "apikey": self.client.key,
             "Authorization": f"Bearer {self.client.key}",
@@ -157,7 +151,6 @@ class TableWrapper:
                     self.data = data
             return Response(resp.json())
         else:
-            print(f"GET error: {resp.status_code} - {resp.text}")
             class Response:
                 def __init__(self):
                     self.data = []
@@ -183,13 +176,11 @@ class TableWrapper:
                         self.data = data
                 return Response(json_data)
             else:
-                print(f"Insert error: {resp.status_code} - {resp.text}")
                 class Response:
                     def __init__(self):
                         self.data = []
                 return Response()
         except Exception as e:
-            print(f"Insert exception: {e}")
             class Response:
                 def __init__(self):
                     self.data = []
@@ -216,7 +207,6 @@ def connect_to_mt4():
         'EURNOK', 'USDCHF', 'USDSGD', 'EURDKK', 'USDHKD'
     ]
     instrument_lookup = {pair: pair for pair in default_pairs}
-    print(f"🔍 Instrument lookup size: {len(instrument_lookup)}")
 
     try:
         pytrader = Pytrader_API()
@@ -240,7 +230,6 @@ def connect_to_mt4():
         pytrader_connected = False
         return False
 
-# ---------- Live price from MT4 ----------
 def get_live_entry_price(pair, signal):
     global pytrader, pytrader_connected
     if not pytrader_connected:
@@ -258,7 +247,7 @@ def get_live_entry_price(pair, signal):
     else:
         return None, False
 
-# ---------- Volume & SL/TP adjustment (unchanged) ----------
+# ---------- Volume & SL/TP ----------
 def get_valid_lot_size(pair, requested_volume):
     global pytrader, pytrader_connected
     if not pytrader_connected:
@@ -353,20 +342,7 @@ def table_exists(table_name):
     ok, _ = supabase_request('GET', table_name + '?limit=1')
     return ok
 
-def create_table_if_not_exists(table_name, sql):
-    # We'll just run the raw SQL via supabase_request if possible, but we use direct REST.
-    # Since we don't have raw SQL endpoint, we'll instruct user to run SQL.
-    # Instead, we'll attempt to create the table using the REST API? Not possible.
-    # So we simply check and print instructions.
-    if not table_exists(table_name):
-        print(f"\n⚠️  Table '{table_name}' does not exist.")
-        print(f"Please create it manually in your Supabase SQL Editor with:")
-        print(sql)
-        return False
-    return True
-
 def init_db():
-    # Create trades and config (if not exist)
     if not table_exists('trades') or not table_exists('config'):
         print("\n⚠️  Tables 'trades' and/or 'config' are missing.")
         print("Please create them manually in your Supabase SQL Editor with:")
@@ -398,7 +374,6 @@ CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp);
     else:
         print("✅ Tables 'trades' and 'config' already exist.")
 
-    # Create pattern_models table if missing
     if not table_exists('pattern_models'):
         print("\n⚠️  Table 'pattern_models' does not exist.")
         print("Please create it manually in your Supabase SQL Editor with:")
@@ -410,7 +385,6 @@ CREATE TABLE IF NOT EXISTS pattern_models (
     model_blob TEXT
 );
         """)
-        print("The app will continue without ML model persistence until this table is created.")
     else:
         print("✅ Table 'pattern_models' already exists.")
 
@@ -581,9 +555,8 @@ def compute_pattern_signal(df):
 
     confidence = max(0, min(1, confidence))
 
-    # Get ML prediction
+    # ML prediction
     ml_signal, ml_confidence = pattern_model.predict_pattern(df)
-    # Combine signals
     if primary != 'HOLD' and ml_signal != 'HOLD':
         if primary == ml_signal:
             confidence = min(1.0, confidence + 0.1)
@@ -733,7 +706,7 @@ def execute_trade(pair, signal, price, tp, sl, volume=TRADE_VOLUME):
     except Exception as e:
         return {"success": False, "error": str(e)}
 
-# ---------- Auto-Trade Loop ----------
+# ---------- Auto-Trade ----------
 def auto_trade_iteration():
     if not auto_trade_enabled:
         return
@@ -814,7 +787,14 @@ def index():
 @app.route('/api/signals', methods=['POST'])
 def get_signals():
     data = request.get_json()
-    pairs_raw = data.get('pairs', 'EURUSD=X, AUDCHF=X, NZDCHF=X, GBPNZD=X, USDCAD=X')
+    DEFAULT_PAIRS = ('EURUSD=X, AUDCHF=X, NZDCHF=X, GBPNZD=X, USDCAD=X, '
+                     'GBPUSD=X, USDJPY=X, AUDUSD=X, EURGBP=X, EURJPY=X, '
+                     'USDCHF=X, NZDUSD=X, AUDJPY=X, EURAUD=X, GBPJPY=X, '
+                     'EURCHF=X, CADJPY=X, AUDNZD=X, EURNZD=X, CHFJPY=X, '
+                     'GBPCHF=X, GBPAUD=X, EURCAD=X, USDCNY=X, USDHKD=X, '
+                     'USDSGD=X, USDSEK=X, USDNOK=X, USDDKK=X, EURNOK=X, '
+                     'EURSEK=X, EURDKK=X, AUDCAD=X, NZDCAD=X, CADCHF=X')
+    pairs_raw = data.get('pairs', DEFAULT_PAIRS)
     pair_list = [p.strip().upper() for p in pairs_raw.split(',') if p.strip()]
     interval = data.get('interval', '1h')
     atr_period = int(data.get('atr_period', 14))
@@ -833,7 +813,14 @@ def get_signals():
 @app.route('/api/autotrade', methods=['POST'])
 def auto_trade():
     data = request.get_json()
-    pairs_raw = data.get('pairs', 'EURUSD=X, AUDCHF=X, NZDCHF=X, GBPNZD=X, USDCAD=X')
+    DEFAULT_PAIRS = ('EURUSD=X, AUDCHF=X, NZDCHF=X, GBPNZD=X, USDCAD=X, '
+                     'GBPUSD=X, USDJPY=X, AUDUSD=X, EURGBP=X, EURJPY=X, '
+                     'USDCHF=X, NZDUSD=X, AUDJPY=X, EURAUD=X, GBPJPY=X, '
+                     'EURCHF=X, CADJPY=X, AUDNZD=X, EURNZD=X, CHFJPY=X, '
+                     'GBPCHF=X, GBPAUD=X, EURCAD=X, USDCNY=X, USDHKD=X, '
+                     'USDSGD=X, USDSEK=X, USDNOK=X, USDDKK=X, EURNOK=X, '
+                     'EURSEK=X, EURDKK=X, AUDCAD=X, NZDCAD=X, CADCHF=X')
+    pairs_raw = data.get('pairs', DEFAULT_PAIRS)
     pair_list = [p.strip().upper() for p in pairs_raw.split(',') if p.strip()]
     interval = data.get('interval', '1h')
     atr_period = int(data.get('atr_period', 14))

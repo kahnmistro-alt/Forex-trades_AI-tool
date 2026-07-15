@@ -3,11 +3,9 @@ yfinance
 pandas
 numpy
 scikit-learn
-dtaidistance
-plotly
-pandas-ta-openbb
-psycopg2-binary
+pandas_ta
+requests
 python-dotenv
+hmmlearn
 supabase
-
 TA-Lib
