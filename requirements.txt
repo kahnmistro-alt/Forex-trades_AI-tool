@@ -3,9 +3,13 @@ yfinance
 pandas
 numpy
 scikit-learn
+scipy
 pandas_ta
 requests
 python-dotenv
 hmmlearn
+gunicorn
 supabase
 TA-Lib
+xgboost 
+lightgbm

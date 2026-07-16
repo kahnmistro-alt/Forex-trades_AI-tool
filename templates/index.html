@@ -9,7 +9,6 @@
 </head>
 <body>
     <div class="app-container">
-        <!-- Top Bar -->
         <nav class="navbar">
             <div class="logo">
                 <i class="fas fa-chart-line"></i>
@@ -21,7 +20,6 @@
             </div>
         </nav>
 
-        <!-- Controls -->
         <div class="controls">
             <div class="control-group">
                 <label><i class="fas fa-robot"></i> Auto‑Trade</label>
@@ -36,13 +34,11 @@
             <button id="refreshBtn" class="btn-primary"><i class="fas fa-sync-alt"></i> Generate Signals</button>
         </div>
 
-        <!-- Signals Table -->
         <div id="loading" class="loading-card hidden">
             <i class="fas fa-spinner fa-pulse"></i> Loading signals...
         </div>
         <div id="errorMsg" class="error-card hidden"></div>
         <div id="summary" class="summary-section"></div>
-        <!-- We removed actionable cards to keep it minimal -->
     </div>
 
     <script src="{{ url_for('static', filename='script.js') }}"></script>

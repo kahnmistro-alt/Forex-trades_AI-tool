@@ -3,6 +3,7 @@ import json
 import time
 import threading
 import requests
+import traceback
 from datetime import datetime, timedelta
 from flask import Flask, render_template, request, jsonify
 import yfinance as yf
@@ -10,6 +11,8 @@ import pandas as pd
 import numpy as np
 import pandas_ta as ta
 from dotenv import load_dotenv
+from candlestick_patterns import detect_candlestick_patterns, get_pattern_signal
+from chart_patterns import detect_chart_patterns
 from pattern_model import PatternModel
 import warnings
 warnings.filterwarnings('ignore')
@@ -25,10 +28,56 @@ except ImportError as e:
 
 app = Flask(__name__)
 
+# ---------- Best parameters from backtest ----------
+RISK_ATR = 1.0
+MIN_CONFIDENCE = 0.6
+REWARD_RATIO = 3.0
+AUTO_TRADE_PAIRS = ['USDJPY', 'GBPUSD']
+
 PYTRADER_SERVER = os.environ.get('PYTRADER_SERVER', 'localhost')
 PYTRADER_PORT = int(os.environ.get('PYTRADER_PORT', 1122))
 PYTRADER_AUTH_CODE = os.environ.get('PYTRADER_AUTH_CODE', 'None')
 TRADE_VOLUME = float(os.environ.get('TRADE_VOLUME', 0.01))
+
+# ---------- Twelve Data ----------
+TWELVE_DATA_API_KEY = os.environ.get('TWELVE_DATA_API_KEY')
+TWELVE_DATA_CACHE_TTL = int(os.environ.get('TWELVE_DATA_CACHE_TTL', 180))
+TWELVE_BASE = 'https://api.twelvedata.com/quote'
+
+_live_price_cache = {}
+_twelve_request_count = 0
+
+def get_live_price_twelve(symbol):
+    if not TWELVE_DATA_API_KEY:
+        return None
+    if len(symbol) == 6 and symbol.isalpha():
+        base = symbol[:3]
+        quote = symbol[3:]
+        symbol_formatted = f"{base}/{quote}"
+    else:
+        symbol_formatted = symbol
+    cache_key = symbol
+    now = time.time()
+    if cache_key in _live_price_cache and (now - _live_price_cache[cache_key]['timestamp'] < TWELVE_DATA_CACHE_TTL):
+        return _live_price_cache[cache_key]['price']
+    try:
+        url = f"{TWELVE_BASE}?symbol={symbol_formatted}&apikey={TWELVE_DATA_API_KEY}"
+        resp = requests.get(url, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            if 'close' in data and data['close'] is not None:
+                price = float(data['close'])
+                _live_price_cache[cache_key] = {'price': price, 'timestamp': now}
+                global _twelve_request_count
+                _twelve_request_count += 1
+                if _twelve_request_count % 50 == 0:
+                    print(f"ℹ️ Twelve Data requests so far: {_twelve_request_count}")
+                return price
+        else:
+            print(f"⚠️ Twelve Data error: {resp.status_code} for {symbol_formatted}")
+    except Exception as e:
+        print(f"⚠️ Twelve Data exception for {symbol}: {e}")
+    return None
 
 # ---------- Supabase ----------
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
@@ -96,7 +145,7 @@ connection_attempt_interval = 60
 auto_trade_enabled = False
 auto_trade_thread = None
 auto_trade_lock = threading.Lock()
-auto_trade_pairs = ['EURUSD', 'AUDCHF', 'NZDCHF', 'GBPNZD', 'USDCAD']  # Demo only
+auto_trade_pairs = AUTO_TRADE_PAIRS
 
 # ---------- ML Model ----------
 class SupabaseClientWrapper:
@@ -194,17 +243,14 @@ def connect_to_mt4():
     global pytrader, pytrader_connected, last_connection_attempt
     if not PYTRADER_AVAILABLE:
         return False
-
     now = time.time()
     if now - last_connection_attempt < connection_attempt_interval and not pytrader_connected:
         return False
-
     last_connection_attempt = now
 
     default_pairs = [
         'EURUSD', 'USDJPY', 'GBPUSD', 'AUDUSD', 'USDCAD',
-        'EURCHF', 'EURGBP', 'AUDCHF', 'NZDCHF', 'GBPNZD',
-        'EURNOK', 'USDCHF', 'USDSGD', 'EURDKK', 'USDHKD'
+        'EURCHF', 'EURGBP', 'AUDCHF', 'NZDCHF', 'GBPNZD'
     ]
     instrument_lookup = {pair: pair for pair in default_pairs}
 
@@ -231,21 +277,26 @@ def connect_to_mt4():
         return False
 
 def get_live_entry_price(pair, signal):
+    symbol = pair.replace('=X', '')
+    price = get_live_price_twelve(symbol)
+    if price is not None:
+        return price, True
     global pytrader, pytrader_connected
     if not pytrader_connected:
         if not connect_to_mt4():
             return None, False
     if pair not in pytrader.instrument_conversion_list:
         pytrader.instrument_conversion_list[pair] = pair
-    quote = pytrader.Get_last_ask_bid(pair)
-    if quote is None:
-        return None, False
-    if signal == 'BUY':
-        return quote['ask'], True
-    elif signal == 'SELL':
-        return quote['bid'], True
-    else:
-        return None, False
+    try:
+        quote = pytrader.Get_last_ask_bid(pair)
+        if quote is not None:
+            if signal == 'BUY':
+                return quote['ask'], True
+            elif signal == 'SELL':
+                return quote['bid'], True
+    except Exception as e:
+        print(f"⚠️ PyTrader error for {pair}: {e}")
+    return None, False
 
 # ---------- Volume & SL/TP ----------
 def get_valid_lot_size(pair, requested_volume):
@@ -286,23 +337,29 @@ def adjust_sl_tp(pair, price, sl, tp):
     sl = round(sl, digits)
     tp = round(tp, digits)
     point = 10 ** -digits
-    min_dist = max(stop_level * point, 20 * point)
+    min_dist = max(stop_level * point, 50 * point)
     if sl < price:  # BUY
         if price - sl < min_dist:
             sl = price - min_dist
         if tp < price or tp - price < min_dist:
-            tp = price + min_dist
+            tp = price + min_dist * 3
     else:  # SELL
         if sl - price < min_dist:
             sl = price + min_dist
         if tp > price or price - tp < min_dist:
-            tp = price - min_dist
+            tp = price - min_dist * 3
     sl = round(sl, digits)
     tp = round(tp, digits)
-    if (sl < price and tp > price) or (sl > price and tp < price):
-        return sl, tp
-    else:
-        return None, None
+    if not ((sl < price and tp > price) or (sl > price and tp < price)):
+        if sl < price:
+            sl = price - min_dist
+            tp = price + min_dist * 3
+        else:
+            sl = price + min_dist
+            tp = price - min_dist * 3
+        sl = round(sl, digits)
+        tp = round(tp, digits)
+    return sl, tp
 
 def validate_sl_tp(pair, price, sl, tp):
     global pytrader, pytrader_connected
@@ -319,16 +376,16 @@ def validate_sl_tp(pair, price, sl, tp):
         stop_level = info.get('stop_level', 10)
         digits = info.get('digits', 5)
     point = 10 ** -digits
-    min_dist = max(stop_level * point, 20 * point)
+    min_dist = max(stop_level * point, 50 * point)
     price = round(price, digits)
     sl = round(sl, digits)
     tp = round(tp, digits)
-    if sl < price and tp > price:  # BUY
+    if sl < price and tp > price:
         if price - sl < min_dist:
             return False, f"SL too close (min {min_dist:.5f})"
         if tp - price < min_dist:
             return False, f"TP too close (min {min_dist:.5f})"
-    elif sl > price and tp < price:  # SELL
+    elif sl > price and tp < price:
         if sl - price < min_dist:
             return False, f"SL too close (min {min_dist:.5f})"
         if price - tp < min_dist:
@@ -433,157 +490,188 @@ def update_confidence_threshold():
     except Exception as e:
         print(f"Error updating confidence threshold: {e}")
 
-# ---------- Pattern Detection ----------
+# ---------- Pattern Recognition ----------
 def get_date_ranges():
     now = datetime.now()
-    cy = now.year
-    train_start = f"{cy-1}-01-01"
-    train_end = f"{cy-1}-12-31"
-    recent_start = f"{cy}-01-01"
     recent_end = now.strftime("%Y-%m-%d")
-    return train_start, train_end, recent_start, recent_end
+    recent_start = (now - timedelta(days=30)).strftime("%Y-%m-%d")
+    return recent_start, recent_end
 
 def fetch_data(pair, start, end, interval):
+    print(f"📊 Fetching {pair} ({interval}) from {start} to {end}...")
+    data = pd.DataFrame()
     try:
-        data = yf.download(pair, start=start, end=end, interval=interval,
-                           progress=False, timeout=30)
-        if data.empty:
-            data = yf.download(pair, start=start, end=end, interval='1d',
-                               progress=False, timeout=30)
+        data = yf.download(
+            pair,
+            start=start,
+            end=end,
+            interval=interval,
+            progress=False,
+            timeout=60,
+            auto_adjust=False,
+            threads=True,
+            ignore_tz=True
+        )
+        if not data.empty:
+            print(f"✅ {pair}: {len(data)} bars ({interval})")
+            if 'Adj Close' in data.columns:
+                data = data.drop(columns=['Adj Close'])
+            data.columns = ['open', 'high', 'low', 'close', 'volume']
+            return data
     except Exception as e:
-        print(f"Error downloading {pair}: {e}")
-        return pd.DataFrame()
-    if 'Adj Close' in data.columns:
-        data = data.drop(columns=['Adj Close'])
-    if data.empty:
-        return data
-    data.columns = ['open', 'high', 'low', 'close', 'volume']
-    return data
+        print(f"❌ {pair} ({interval}) error: {e}")
+    try:
+        print(f"📊 {pair}: falling back to daily...")
+        data = yf.download(
+            pair,
+            start=start,
+            end=end,
+            interval='1d',
+            progress=False,
+            timeout=60
+        )
+        if not data.empty:
+            print(f"✅ {pair}: {len(data)} daily bars")
+            if 'Adj Close' in data.columns:
+                data = data.drop(columns=['Adj Close'])
+            data.columns = ['open', 'high', 'low', 'close', 'volume']
+            return data
+    except Exception as e:
+        print(f"❌ {pair} daily fallback error: {e}")
+    try:
+        print(f"📊 {pair}: trying with period='1mo'...")
+        data = yf.download(
+            pair,
+            period='1mo',
+            interval='1h',
+            progress=False,
+            timeout=60
+        )
+        if not data.empty:
+            print(f"✅ {pair}: {len(data)} bars (period='1mo')")
+            if 'Adj Close' in data.columns:
+                data = data.drop(columns=['Adj Close'])
+            data.columns = ['open', 'high', 'low', 'close', 'volume']
+            return data
+    except Exception as e:
+        print(f"❌ {pair} period fallback error: {e}")
+    print(f"❌ No data for {pair} after all attempts.")
+    return pd.DataFrame()
 
-def detect_support_resistance(df, window=20, tolerance=0.005):
-    high = df['high']
-    low = df['low']
-    piv_high = high[(high.shift(1) < high) & (high.shift(-1) < high)]
-    piv_low = low[(low.shift(1) > low) & (low.shift(-1) > low)]
-    if len(piv_high) == 0 or len(piv_low) == 0:
+def detect_support_resistance(df, window=20):
+    try:
+        high = df['high']
+        low = df['low']
+        piv_high = high[(high.shift(1) < high) & (high.shift(-1) < high)]
+        piv_low = low[(low.shift(1) > low) & (low.shift(-1) > low)]
+        if len(piv_high) == 0 or len(piv_low) == 0:
+            return None, None
+        current = df['close'].iloc[-1]
+        support = piv_low[piv_low < current].max() if any(piv_low < current) else None
+        resistance = piv_high[piv_high > current].min() if any(piv_high > current) else None
+        return support, resistance
+    except:
         return None, None
-    current = df['close'].iloc[-1]
-    support = piv_low[piv_low < current].max() if any(piv_low < current) else None
-    resistance = piv_high[piv_high > current].min() if any(piv_high > current) else None
-    return support, resistance
-
-def detect_candlestick_patterns(df):
-    patterns = {}
-    cdl = ta.cdl_pattern(df['open'], df['high'], df['low'], df['close'], name='all')
-    if cdl is not None:
-        last = cdl.iloc[-1]
-        for col in last.index:
-            val = last[col]
-            if val == 100:
-                patterns[col] = 'bullish'
-            elif val == -100:
-                patterns[col] = 'bearish'
-    if len(df) >= 2:
-        prev = df.iloc[-2]
-        curr = df.iloc[-1]
-        if (prev['close'] < prev['open'] and curr['close'] > curr['open'] and
-            curr['open'] < prev['close'] and curr['close'] > prev['open']):
-            patterns['CDL_ENGULFING_BULL'] = 'bullish'
-        if (prev['close'] > prev['open'] and curr['close'] < curr['open'] and
-            curr['open'] > prev['close'] and curr['close'] < prev['open']):
-            patterns['CDL_ENGULFING_BEAR'] = 'bearish'
-    return patterns
 
 def detect_trend(df, ma_short=20, ma_long=50):
-    if len(df) < ma_long:
-        return 'neutral'
-    sma_short = df['close'].rolling(ma_short).mean().iloc[-1]
-    sma_long = df['close'].rolling(ma_long).mean().iloc[-1]
-    short_slope = df['close'].rolling(ma_short).mean().diff(5).iloc[-1]
-    if sma_short > sma_long and short_slope > 0:
-        return 'uptrend'
-    elif sma_short < sma_long and short_slope < 0:
-        return 'downtrend'
-    else:
+    try:
+        if len(df) < ma_long:
+            return 'neutral'
+        sma_short = df['close'].rolling(ma_short).mean().iloc[-1]
+        sma_long = df['close'].rolling(ma_long).mean().iloc[-1]
+        short_slope = df['close'].rolling(ma_short).mean().diff(5).iloc[-1]
+        if sma_short > sma_long and short_slope > 0:
+            return 'uptrend'
+        elif sma_short < sma_long and short_slope < 0:
+            return 'downtrend'
+        else:
+            return 'neutral'
+    except:
         return 'neutral'
 
 def detect_breakout(df, lookback=20, threshold=0.002):
-    high = df['high'].iloc[-lookback:-1].max()
-    low = df['low'].iloc[-lookback:-1].min()
-    curr_close = df['close'].iloc[-1]
-    if curr_close > high * (1 + threshold):
-        return 'breakout_up'
-    elif curr_close < low * (1 - threshold):
-        return 'breakout_down'
-    else:
+    try:
+        high = df['high'].iloc[-lookback:-1].max()
+        low = df['low'].iloc[-lookback:-1].min()
+        curr_close = df['close'].iloc[-1]
+        if curr_close > high * (1 + threshold):
+            return 'breakout_up'
+        elif curr_close < low * (1 - threshold):
+            return 'breakout_down'
+        else:
+            return None
+    except:
         return None
 
 def compute_pattern_signal(df):
-    support, resistance = detect_support_resistance(df)
-    patterns = detect_candlestick_patterns(df)
-    trend = detect_trend(df)
-    breakout = detect_breakout(df)
-
-    bullish_count = sum(1 for p, d in patterns.items() if d == 'bullish')
-    bearish_count = sum(1 for p, d in patterns.items() if d == 'bearish')
-
-    if bullish_count > bearish_count:
-        primary = 'BUY'
-        pattern_strength = bullish_count / (bullish_count + bearish_count + 1e-6)
-    elif bearish_count > bullish_count:
-        primary = 'SELL'
-        pattern_strength = bearish_count / (bullish_count + bearish_count + 1e-6)
-    else:
-        primary = 'HOLD'
-        pattern_strength = 0.0
-
-    if primary == 'BUY' and trend == 'uptrend':
-        confidence = 0.7 + 0.3 * pattern_strength
-    elif primary == 'SELL' and trend == 'downtrend':
-        confidence = 0.7 + 0.3 * pattern_strength
-    elif primary == 'BUY' and (support is not None and df['close'].iloc[-1] < support * 1.01):
-        confidence = 0.6 + 0.2 * pattern_strength
-    elif primary == 'SELL' and (resistance is not None and df['close'].iloc[-1] > resistance * 0.99):
-        confidence = 0.6 + 0.2 * pattern_strength
-    else:
-        confidence = 0.3 * pattern_strength
-
-    if breakout == 'breakout_up' and primary == 'BUY':
-        confidence = min(1.0, confidence + 0.2)
-    elif breakout == 'breakout_down' and primary == 'SELL':
-        confidence = min(1.0, confidence + 0.2)
-
-    confidence = max(0, min(1, confidence))
-
-    # ML prediction
     ml_signal, ml_confidence = pattern_model.predict_pattern(df)
-    if primary != 'HOLD' and ml_signal != 'HOLD':
-        if primary == ml_signal:
-            confidence = min(1.0, confidence + 0.1)
-        else:
-            confidence = max(0.0, confidence - 0.1)
-    elif primary == 'HOLD' and ml_signal != 'HOLD' and ml_confidence > 0.7:
-        primary = ml_signal
-        confidence = ml_confidence * 0.8
-
-    min_conf = get_min_confidence()
-    if confidence >= min_conf:
-        signal = primary
+    if ml_confidence > 0.55 and ml_signal != 'HOLD':
+        signal = ml_signal
+        confidence = ml_confidence
     else:
-        signal = 'HOLD'
-
+        candle_patterns = detect_candlestick_patterns(df)
+        candle_signal, candle_conf = get_pattern_signal(candle_patterns)
+        chart_patterns = detect_chart_patterns(df, lookback=40) if len(df) >= 40 else []
+        support, resistance = detect_support_resistance(df)
+        trend = detect_trend(df)
+        breakout = detect_breakout(df)
+        if candle_signal != 'HOLD':
+            signal = candle_signal
+            confidence = candle_conf
+            for pat in chart_patterns:
+                if pat in ['double_bottom', 'inverse_head_shoulders', 'ascending_triangle'] and signal == 'BUY':
+                    confidence = min(1.0, confidence + 0.15)
+                elif pat in ['double_top', 'head_shoulders', 'descending_triangle'] and signal == 'SELL':
+                    confidence = min(1.0, confidence + 0.15)
+            if signal == 'BUY' and trend == 'uptrend':
+                confidence = min(1.0, confidence + 0.1)
+            elif signal == 'SELL' and trend == 'downtrend':
+                confidence = min(1.0, confidence + 0.1)
+        else:
+            if chart_patterns:
+                bullish_pats = ['double_bottom', 'inverse_head_shoulders', 'ascending_triangle', 'falling_wedge']
+                bearish_pats = ['double_top', 'head_shoulders', 'descending_triangle', 'rising_wedge']
+                bullish = sum(1 for p in chart_patterns if p in bullish_pats)
+                bearish = sum(1 for p in chart_patterns if p in bearish_pats)
+                if bullish > bearish:
+                    signal = 'BUY'
+                    confidence = 0.5 + 0.3 * (bullish / (bullish + bearish + 1e-6))
+                elif bearish > bullish:
+                    signal = 'SELL'
+                    confidence = 0.5 + 0.3 * (bearish / (bullish + bearish + 1e-6))
+                else:
+                    signal = 'HOLD'
+                    confidence = 0.0
+                if signal == 'BUY' and trend == 'uptrend':
+                    confidence = min(1.0, confidence + 0.2)
+                elif signal == 'SELL' and trend == 'downtrend':
+                    confidence = min(1.0, confidence + 0.2)
+            else:
+                signal = 'HOLD'
+                confidence = 0.0
+    trend = detect_trend(df, ma_short=20, ma_long=200)
+    if signal != 'HOLD':
+        if signal == 'BUY' and trend == 'downtrend':
+            signal = 'HOLD'
+            confidence = 0.0
+        elif signal == 'SELL' and trend == 'uptrend':
+            signal = 'HOLD'
+            confidence = 0.0
+    min_conf = get_min_confidence()
+    if confidence >= min_conf and signal != 'HOLD':
+        final_signal = signal
+    else:
+        final_signal = 'HOLD'
     details = {
-        'patterns': patterns,
         'trend': trend,
-        'support': support,
-        'resistance': resistance,
-        'breakout': breakout,
-        'bullish_count': bullish_count,
-        'bearish_count': bearish_count
+        'support': support if 'support' in locals() else None,
+        'resistance': resistance if 'resistance' in locals() else None,
+        'breakout': breakout if 'breakout' in locals() else None
     }
-    return signal, confidence, details
+    return final_signal, confidence, details
 
-def compute_tp_sl(price, atr, signal, risk_atr=1.0, reward_ratio=3.0):
+# ---------- FIXED compute_tp_sl returns (sl, tp) ----------
+def compute_tp_sl(price, atr, signal, risk_atr=RISK_ATR, reward_ratio=REWARD_RATIO):
     risk = atr * risk_atr
     if signal == 'BUY':
         sl = price - risk
@@ -591,35 +679,30 @@ def compute_tp_sl(price, atr, signal, risk_atr=1.0, reward_ratio=3.0):
     else:
         sl = price + risk
         tp = price - risk * reward_ratio
-    return tp, sl
+    return sl, tp   # now returns (sl, tp) in correct order
 
 def process_pair(pair, interval, atr_period, risk_mult, reward_ratio):
-    train_start, train_end, recent_start, recent_end = get_date_ranges()
+    recent_start, recent_end = get_date_ranges()
+    print(f"🔍 Processing {pair}...")
     try:
         df = fetch_data(pair, recent_start, recent_end, interval)
         if df.empty or len(df) < 60:
             return None
-
         df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=atr_period)
         df['volatility'] = df['close'].pct_change().rolling(20).std()
         df = df.dropna()
         if df.empty:
             return None
-
         signal, confidence, details = compute_pattern_signal(df)
         current_atr = df['atr'].iloc[-1]
-
         live_price, live_ok = get_live_entry_price(pair, signal)
         if live_ok:
             reference_price = live_price
         else:
             reference_price = df['close'].iloc[-1]
-
         raw_sl, raw_tp = compute_tp_sl(reference_price, current_atr, signal,
                                        risk_atr=risk_mult, reward_ratio=reward_ratio)
-
         adjusted_sl, adjusted_tp = adjust_sl_tp(pair, reference_price, raw_sl, raw_tp)
-
         if adjusted_sl is None or adjusted_tp is None:
             can_trade = False
             reason = "Cannot adjust SL/TP to valid levels"
@@ -627,7 +710,6 @@ def process_pair(pair, interval, atr_period, risk_mult, reward_ratio):
         else:
             sl, tp = adjusted_sl, adjusted_tp
             can_trade, reason = validate_sl_tp(pair, reference_price, sl, tp)
-
         chart_data = {
             "dates": [str(d) for d in df.index[-100:]],
             "prices": df['close'].iloc[-100:].tolist(),
@@ -637,14 +719,13 @@ def process_pair(pair, interval, atr_period, risk_mult, reward_ratio):
                 "signal": signal
             } if signal != "HOLD" else None
         }
-
         return {
             "pair": pair.replace("=X", ""),
             "signal": signal,
             "confidence": round(confidence, 3),
             "price": round(reference_price, 5),
-            "tp": round(tp, 5),
-            "sl": round(sl, 5),
+            "tp": round(tp, 5),   # now TP is correctly above entry for BUY
+            "sl": round(sl, 5),   # now SL is correctly below entry for BUY
             "atr": round(current_atr, 5),
             "can_trade": can_trade,
             "can_trade_reason": reason,
@@ -654,6 +735,8 @@ def process_pair(pair, interval, atr_period, risk_mult, reward_ratio):
             "error": None
         }
     except Exception as e:
+        print(f"❌ Error processing {pair}: {e}")
+        traceback.print_exc()
         return {"pair": pair, "error": str(e)[:100]}
 
 def execute_trade(pair, signal, price, tp, sl, volume=TRADE_VOLUME):
@@ -663,16 +746,13 @@ def execute_trade(pair, signal, price, tp, sl, volume=TRADE_VOLUME):
     if not pytrader_connected:
         if not connect_to_mt4():
             return {"success": False, "error": "Could not connect to MT4"}
-
     if pair not in pytrader.instrument_conversion_list:
         pytrader.instrument_conversion_list[pair] = pair
-
     live_price, live_ok = get_live_entry_price(pair, signal)
     if not live_ok:
         ref_price = price
     else:
         ref_price = live_price
-
     adjusted_volume = get_valid_lot_size(pair, volume)
     adjusted_sl, adjusted_tp = adjust_sl_tp(pair, ref_price, sl, tp)
     if adjusted_sl is None or adjusted_tp is None:
@@ -680,7 +760,6 @@ def execute_trade(pair, signal, price, tp, sl, volume=TRADE_VOLUME):
     valid, reason = validate_sl_tp(pair, ref_price, adjusted_sl, adjusted_tp)
     if not valid:
         return {"success": False, "error": f"SL/TP invalid: {reason}"}
-
     try:
         ordertype = "buy" if signal.upper() == "BUY" else "sell"
         ticket = pytrader.Open_order(
@@ -713,11 +792,10 @@ def auto_trade_iteration():
     print(f"[Auto-Trade] Running at {datetime.now().strftime('%H:%M:%S')}")
     interval = '1h'
     atr_period = 14
-    risk_mult = 1.0
-    reward_ratio = 3.0
+    risk_mult = RISK_ATR
+    reward_ratio = REWARD_RATIO
     volume = TRADE_VOLUME
     pairs = auto_trade_pairs
-
     for pair in pairs:
         yf_pair = pair if '=X' in pair else pair + '=X'
         res = process_pair(yf_pair, interval, atr_period, risk_mult, reward_ratio)
@@ -750,35 +828,6 @@ def start_auto_trade_thread():
         auto_trade_thread.start()
         print("🚀 Auto-trade thread started (runs every 60s).")
 
-# ---------- ML Auto-training ----------
-training_lock = threading.Lock()
-last_training_time = None
-
-def train_model_background():
-    global last_training_time
-    with training_lock:
-        print(f"[ML] Starting model training at {datetime.now()}")
-        try:
-            pair = 'EURUSD=X'
-            end = datetime.now().strftime('%Y-%m-%d')
-            start = (datetime.now() - timedelta(days=180)).strftime('%Y-%m-%d')
-            df = fetch_data(pair, start, end, '1h')
-            if df.empty:
-                print("[ML] No data fetched for training.")
-                return
-            success = pattern_model.train(df, labels=None)
-            if success:
-                last_training_time = datetime.now()
-                print(f"[ML] Model training completed at {last_training_time}")
-            else:
-                print("[ML] Training failed.")
-        except Exception as e:
-            print(f"[ML] Training error: {e}")
-
-def schedule_training():
-    train_model_background()
-    threading.Timer(600, schedule_training).start()
-
 # ---------- Flask Routes ----------
 @app.route('/')
 def index():
@@ -787,22 +836,14 @@ def index():
 @app.route('/api/signals', methods=['POST'])
 def get_signals():
     data = request.get_json()
-    DEFAULT_PAIRS = ('EURUSD=X, AUDCHF=X, NZDCHF=X, GBPNZD=X, USDCAD=X, '
-                     'GBPUSD=X, USDJPY=X, AUDUSD=X, EURGBP=X, EURJPY=X, '
-                     'USDCHF=X, NZDUSD=X, AUDJPY=X, EURAUD=X, GBPJPY=X, '
-                     'EURCHF=X, CADJPY=X, AUDNZD=X, EURNZD=X, CHFJPY=X, '
-                     'GBPCHF=X, GBPAUD=X, EURCAD=X, USDCNY=X, USDHKD=X, '
-                     'USDSGD=X, USDSEK=X, USDNOK=X, USDDKK=X, EURNOK=X, '
-                     'EURSEK=X, EURDKK=X, AUDCAD=X, NZDCAD=X, CADCHF=X')
+    DEFAULT_PAIRS = 'EURUSD=X, GBPUSD=X, USDJPY=X, AUDUSD=X, USDCAD=X'
     pairs_raw = data.get('pairs', DEFAULT_PAIRS)
     pair_list = [p.strip().upper() for p in pairs_raw.split(',') if p.strip()]
     interval = data.get('interval', '1h')
     atr_period = int(data.get('atr_period', 14))
-    risk_mult = float(data.get('risk_mult', 1.0))
-    reward_ratio = 3.0
-
+    risk_mult = float(data.get('risk_mult', RISK_ATR))
+    reward_ratio = REWARD_RATIO
     update_confidence_threshold()
-
     results = []
     for pair in pair_list:
         res = process_pair(pair, interval, atr_period, risk_mult, reward_ratio)
@@ -813,23 +854,15 @@ def get_signals():
 @app.route('/api/autotrade', methods=['POST'])
 def auto_trade():
     data = request.get_json()
-    DEFAULT_PAIRS = ('EURUSD=X, AUDCHF=X, NZDCHF=X, GBPNZD=X, USDCAD=X, '
-                     'GBPUSD=X, USDJPY=X, AUDUSD=X, EURGBP=X, EURJPY=X, '
-                     'USDCHF=X, NZDUSD=X, AUDJPY=X, EURAUD=X, GBPJPY=X, '
-                     'EURCHF=X, CADJPY=X, AUDNZD=X, EURNZD=X, CHFJPY=X, '
-                     'GBPCHF=X, GBPAUD=X, EURCAD=X, USDCNY=X, USDHKD=X, '
-                     'USDSGD=X, USDSEK=X, USDNOK=X, USDDKK=X, EURNOK=X, '
-                     'EURSEK=X, EURDKK=X, AUDCAD=X, NZDCAD=X, CADCHF=X')
+    DEFAULT_PAIRS = 'EURUSD=X, GBPUSD=X, USDJPY=X, AUDUSD=X, USDCAD=X'
     pairs_raw = data.get('pairs', DEFAULT_PAIRS)
     pair_list = [p.strip().upper() for p in pairs_raw.split(',') if p.strip()]
     interval = data.get('interval', '1h')
     atr_period = int(data.get('atr_period', 14))
-    risk_mult = float(data.get('risk_mult', 1.0))
+    risk_mult = float(data.get('risk_mult', RISK_ATR))
     volume = float(data.get('volume', TRADE_VOLUME))
-    reward_ratio = 3.0
-
+    reward_ratio = REWARD_RATIO
     update_confidence_threshold()
-
     results = []
     for pair in pair_list:
         res = process_pair(pair, interval, atr_period, risk_mult, reward_ratio)
@@ -873,9 +906,12 @@ def set_auto_trade_pairs():
     pairs_raw = data.get('pairs', '')
     if pairs_raw:
         pair_list = [p.strip().upper() for p in pairs_raw.split(',') if p.strip()]
-        auto_trade_pairs = [p.replace('=X', '') for p in pair_list]
+        allowed = ['USDJPY', 'GBPUSD']
+        auto_trade_pairs = [p.replace('=X', '') for p in pair_list if p.replace('=X', '') in allowed]
+        if not auto_trade_pairs:
+            auto_trade_pairs = ['USDJPY', 'GBPUSD']
     else:
-        auto_trade_pairs = []
+        auto_trade_pairs = ['USDJPY', 'GBPUSD']
     return jsonify({"pairs": auto_trade_pairs})
 
 @app.route('/api/update_trade', methods=['POST'])
@@ -898,6 +934,19 @@ if __name__ == '__main__':
     print(f"✅ Database ready. Min confidence: {get_min_confidence()}")
     if PYTRADER_AVAILABLE:
         connect_to_mt4()
-    schedule_training()
+    if TWELVE_DATA_API_KEY:
+        test_price = get_live_price_twelve('EURUSD')
+        if test_price:
+            print(f"✅ Twelve Data works: EURUSD = {test_price}")
+        else:
+            print("❌ Twelve Data failed – check API key")
+    else:
+        print("ℹ️ Twelve Data API key not set – using PyTrader/yfinance for prices.")
+    test_pair = 'EURUSD=X'
+    test_data = fetch_data(test_pair, (datetime.now() - timedelta(days=5)).strftime('%Y-%m-%d'), datetime.now().strftime('%Y-%m-%d'), '1h')
+    if not test_data.empty:
+        print(f"✅ yfinance works: fetched {len(test_data)} bars for {test_pair}")
+    else:
+        print(f"❌ yfinance failed for {test_pair}. Check internet connection and package.")
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)

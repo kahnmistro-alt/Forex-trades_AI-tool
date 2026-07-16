@@ -7,7 +7,6 @@ document.addEventListener('DOMContentLoaded', () => {
             const autoTradeToggle = document.getElementById('autoTradeToggle');
             const autoTradeStatus = document.getElementById('autoTradeStatus');
 
-            // ----- Auto‑Trade toggle -----
             if (autoTradeToggle) {
                 fetch('/api/auto_trade_status')
                     .then(res => res.json())
@@ -19,8 +18,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
                 autoTradeToggle.addEventListener('change', () => {
                     const enabled = autoTradeToggle.checked;
-                    // Send fixed pairs to auto‑trade (only the 5 demo pairs)
-                    const fixedPairs = 'EURUSD=X, AUDCHF=X, NZDCHF=X, GBPNZD=X, USDCAD=X';
+                    const fixedPairs = 'EURUSD=X, GBPUSD=X, USDJPY=X, AUDUSD=X, USDCAD=X';
                     if (enabled) {
                         fetch('/api/auto_trade_pairs', {
                             method: 'POST',
@@ -41,14 +39,12 @@ document.addEventListener('DOMContentLoaded', () => {
                 });
             }
 
-            // ----- Server time -----
             function updateServerTime() {
                 document.getElementById('serverTime').innerHTML = `<i class="far fa-clock"></i> ${new Date().toLocaleString()}`;
             }
             updateServerTime();
             setInterval(updateServerTime, 1000);
 
-            // ----- Generate Signals -----
             refreshBtn.addEventListener('click', refreshSignals);
 
             async function refreshSignals() {
@@ -56,9 +52,9 @@ document.addEventListener('DOMContentLoaded', () => {
                 errorDiv.classList.add('hidden');
                 summaryDiv.innerHTML = '';
 
-                // Fixed parameters – you can change these in the code
+                const pairs = 'EURUSD=X, GBPUSD=X, USDJPY=X, AUDUSD=X, USDCAD=X';
                 const payload = {
-                    pairs: 'EURUSD=X, AUDCHF=X, NZDCHF=X, GBPNZD=X, USDCAD=X, GBPUSD=X, USDJPY=X, AUDUSD=X, EURGBP=X, EURJPY=X, USDCHF=X, NZDUSD=X, AUDJPY=X, EURAUD=X, GBPJPY=X, EURCHF=X, CADJPY=X, AUDNZD=X, EURNZD=X, CHFJPY=X, GBPCHF=X, GBPAUD=X, EURCAD=X, USDCNY=X, USDHKD=X, USDSGD=X, USDSEK=X, USDNOK=X, USDDKK=X, EURNOK=X, EURSEK=X, EURDKK=X, AUDCAD=X, NZDCAD=X, CADCHF=X',
+                    pairs: pairs,
                     interval: '1h',
                     atr_period: 14,
                     risk_mult: 1.0
@@ -94,7 +90,6 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
-    // ---------- Table ----------
     function renderSummary(results) {
         if (!results.length) return;
         const title = document.createElement('h2');
@@ -123,15 +118,16 @@ document.addEventListener('DOMContentLoaded', () => {
             const sigCell = row.insertCell(1);
             sigCell.innerHTML = `<span class="signal-${r.signal}">${r.signal}</span>`;
             row.insertCell(2).textContent = r.confidence;
-            const patterns = r.pattern_details ? Object.keys(r.pattern_details.patterns).join(', ') : 'None';
+
+            const patterns = r.pattern_details ? Object.keys(r.pattern_details.candle_patterns || {}).join(', ') : 'None';
             row.insertCell(3).textContent = patterns;
+
             row.insertCell(4).textContent = r.trend || 'neutral';
             row.insertCell(5).textContent = r.price;
             row.insertCell(6).textContent = r.tp;
             row.insertCell(7).textContent = r.sl;
             row.insertCell(8).textContent = r.atr;
 
-            // Copy
             const copyCell = row.insertCell(9);
             const copyBtn = document.createElement('button');
             copyBtn.textContent = '📋 Copy';
@@ -142,7 +138,6 @@ document.addEventListener('DOMContentLoaded', () => {
             });
             copyCell.appendChild(copyBtn);
 
-            // Trade
             const tradeCell = row.insertCell(10);
             if (r.signal !== 'HOLD') {
                 const tradeBtn = document.createElement('button');
@@ -173,15 +168,13 @@ document.addEventListener('DOMContentLoaded', () => {
         summaryDiv.appendChild(table);
     }
 
-    // ---------- Trade Execution ----------
     async function tradeNow(pair, signal, price, tp, sl) {
-        const volume = 0.01; // fixed
         const payload = {
             pairs: pair + '=X',
             interval: '1h',
             atr_period: 14,
             risk_mult: 1.0,
-            volume: volume
+            volume: 0.01
         };
         try {
             const resp = await fetch('/api/autotrade', {
