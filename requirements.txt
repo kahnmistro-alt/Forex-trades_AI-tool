@@ -3,7 +3,7 @@ requests
 yfinance
 pandas
 numpy
-pandas-ta==0.3.14b0
+pandas-ta
 python-dotenv
 scikit-learn
 xgboost
