@@ -3,13 +3,10 @@ requests
 yfinance
 pandas
 numpy
-pandas-ta
+pandas-ta==0.3.14b0
 python-dotenv
 scikit-learn
 xgboost
 hmmlearn
 scipy
 gunicorn
-supabase
-TA-Lib
-numba>=0.63.0
