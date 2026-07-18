@@ -198,5 +198,34 @@ document.addEventListener('DOMContentLoaded', () => {
         navigator.clipboard.writeText(text);
     }
 
-    window.tradeNow = tradeNow;
+    // Retrain button handler
+    document.getElementById('retrainBtn').addEventListener('click', async () => {
+        const btn = document.getElementById('retrainBtn');
+        const status = document.getElementById('retrainStatus');
+        btn.disabled = true;
+        btn.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Retraining...';
+        status.textContent = 'Retraining started...';
+        try {
+            const resp = await fetch('/api/retrain_all', { method: 'POST' });
+            const data = await resp.json();
+            if (data.success) {
+                let msg = 'Retraining completed: ';
+                for (const [pair, res] of Object.entries(data.results)) {
+                    if (res.success) {
+                        msg += `${pair} (acc: ${res.accuracy.toFixed(3)}), `;
+                    } else {
+                        msg += `${pair} (failed: ${res.error}), `;
+                    }
+                }
+                status.textContent = msg.slice(0, -2);
+            } else {
+                status.textContent = 'Error: ' + data.error;
+            }
+        } catch (err) {
+            status.textContent = 'Network error: ' + err.message;
+        } finally {
+            btn.disabled = false;
+            btn.innerHTML = '<i class="fas fa-sync-alt"></i> Retrain All Models';
+        }
+    });
 });
