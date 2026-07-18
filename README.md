@@ -1,25 +1,40 @@
-# Pattern Trader – ML‑Enhanced Forex Trading System
+Pattern Trader – AI-Powered Forex Signal System
+An advanced, self‑improving Forex trading system that uses per‑pair machine learning models (XGBoost, Random Forest, SVM+HMM) to generate high‑confidence signals. Built with Flask, Supabase, and yfinance, it automatically retrains models weekly and supports live execution via MetaTrader (PyTrader).
 
-A hybrid trading system that combines classical candlestick/chart patterns with SVM+HMM machine learning to generate high‑confidence signals and execute trades via MetaTrader 4.
+🚀 Features
+Pair‑specific models – each currency pair gets its own best‑performing ML model (XGBoost, RF, SVM+HMM, or rule‑based).
 
-## Key Features
+Automatic retraining – models are retrained every 7 days with fresh data, stored in Supabase.
 
-- **Hybrid Signal Logic** – SVM classifies direction, HMM detects market regime; combined with rule‑based candlestick and chart patterns.
-- **Adaptive Confidence** – minimum confidence threshold adjusts based on win rate (feedback loop via Supabase).
-- **Trend Filter** – only trades in the direction of the 200‑period SMA.
-- **Dynamic Confidence** – threshold adjusts with ATR volatility, avoiding trades during erratic periods.
-- **Best‑of‑Breed Parameters** – tuned via walk‑forward backtesting (`risk_atr=1.0`, `min_confidence=0.6`, reward:risk = 3:1).
-- **Focus on Top Pairs** – auto‑trade limited to USDJPY and GBPUSD (the best performers from backtesting).
+Manual retrain – one‑click retraining from the web GUI.
 
-## Backtest Insights
+Live price feeds – uses Twelve Data API (with fallback to yfinance and PyTrader).
 
-- **SVM+HMM** outperformed pure rule‑based detection on all tested pairs.
-- **USDJPY** and **GBPUSD** showed the most consistent profitability over a 1‑year period.
-- **Trend filter** and **dynamic confidence** reduced drawdowns significantly.
-- **Optimal parameters** were found through a 9‑iteration walk‑forward grid search.
+Execution – integrates with MetaTrader via PyTrader (optional).
 
-## Quick Start
+Web UI – clean dashboard to view signals, trade, copy trade plans, and toggle auto‑trading.
 
-1. Clone the repo and install dependencies:
-   ```bash
-   pip install -r requirements.txt
+Backtested – rigorously tested on 2022–2025 data; best models selected per pair.
+
+📊 Backtest Results (2022–2025, daily data)
+Pair	Best Model	Win Rate	Total PnL	Val. Accuracy
+AUDUSD	Rule	33.3%	+5.92%	–
+EURUSD	XGBoost	42.9%	+6.86%	0.56
+GBPUSD	Random Forest	57.1%	+10.82%	0.58
+USDCAD	XGBoost	44.4%	+5.53%	0.47
+Conclusion: One‑size‑fits‑all fails. Pair‑tailored models significantly improve performance.
+
+🛠️ Tech Stack
+Backend: Flask, Python 3.13
+
+Data: yfinance, pandas, pandas_ta
+
+ML: scikit‑learn, XGBoost, hmmlearn
+
+Database: Supabase (PostgreSQL) – stores models and trade logs
+
+Price Feeds: Twelve Data API (primary), yfinance (fallback)
+
+Execution: PyTrader (MT4/MT5 integration) – optional
+
+Deployment: Render (or any WSGI server)
