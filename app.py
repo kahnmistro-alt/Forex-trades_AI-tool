@@ -231,10 +231,10 @@ class TableWrapper:
 
 supabase_wrapper = SupabaseClientWrapper(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
-# ---------- Per-Pair Model Configuration ----------
+# ---------- Per-Pair Model Configuration (UPDATED: EURUSD → rf) ----------
 PAIR_MODEL_TYPES = {
     'AUDUSD': 'rule',
-    'EURUSD': 'xgboost',
+    'EURUSD': 'rf',          # <-- changed from 'xgboost'
     'GBPUSD': 'rf',
     'USDCAD': 'xgboost',
 }
@@ -254,7 +254,8 @@ print("✅ Per‑pair models loaded.")
 def get_date_ranges():
     now = datetime.now()
     recent_end = now.strftime("%Y-%m-%d")
-    recent_start = (now - timedelta(days=30)).strftime("%Y-%m-%d")
+    # Use 60 days to ensure enough data for rule-based pattern detection
+    recent_start = (now - timedelta(days=60)).strftime("%Y-%m-%d")
     return recent_start, recent_end
 
 def fetch_data(pair, start, end, interval):
@@ -583,7 +584,7 @@ def init_db():
     if not table_exists('trades') or not table_exists('config'):
         print("\n⚠️  Tables 'trades' and/or 'config' are missing.")
         print("Please create them manually in your Supabase SQL Editor with:")
-        print("""
+        print(""" 
 CREATE TABLE IF NOT EXISTS trades (
     id SERIAL PRIMARY KEY,
     timestamp TIMESTAMP DEFAULT NOW(),
@@ -614,7 +615,7 @@ CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp);
     if not table_exists('pair_models'):
         print("\n⚠️  Table 'pair_models' does not exist.")
         print("Please create it manually in your Supabase SQL Editor with:")
-        print("""
+        print(""" 
 CREATE TABLE IF NOT EXISTS pair_models (
     id SERIAL PRIMARY KEY,
     pair TEXT NOT NULL,
@@ -628,6 +629,27 @@ CREATE INDEX IF NOT EXISTS idx_pair_model ON pair_models(pair, model_type, creat
         """)
     else:
         print("✅ Table 'pair_models' already exists.")
+
+    # New table for prediction logging
+    if not table_exists('predictions'):
+        print("\n⚠️  Table 'predictions' does not exist. Creating...")
+        print("Please run the following SQL to create it:")
+        print(""" 
+CREATE TABLE IF NOT EXISTS predictions (
+    id SERIAL PRIMARY KEY,
+    pair TEXT,
+    signal TEXT,
+    confidence FLOAT,
+    entry_price FLOAT,
+    predicted_tp FLOAT,
+    predicted_sl FLOAT,
+    actual_outcome TEXT,
+    actual_pnl FLOAT,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+        """)
+    else:
+        print("✅ Table 'predictions' already exists.")
 
 def get_min_confidence():
     ok, result = supabase_request('GET', 'config?key=eq.min_confidence')
@@ -652,6 +674,25 @@ def log_trade(pair, signal, price, tp, sl, result, pnl):
     ok, _ = supabase_request('POST', 'trades', data)
     if not ok:
         print(f"Could not log trade: {_}")
+
+def log_prediction(pair, signal, confidence, price, tp, sl):
+    data = {
+        'pair': pair,
+        'signal': signal,
+        'confidence': confidence,
+        'entry_price': price,
+        'predicted_tp': tp,
+        'predicted_sl': sl,
+        'actual_outcome': None,
+        'actual_pnl': None,
+        'created_at': datetime.now().isoformat()
+    }
+    ok, _ = supabase_request('POST', 'predictions', data)
+    if not ok:
+        print(f"Could not log prediction: {_}")
+
+def update_prediction_outcome(prediction_id, outcome, pnl):
+    supabase_request('PATCH', f'predictions?id=eq.{prediction_id}', {'actual_outcome': outcome, 'actual_pnl': pnl})
 
 def update_trade_result(trade_id, result, pnl):
     supabase_request('PATCH', f'trades?id=eq.{trade_id}', {'result': result, 'pnl': pnl})
@@ -691,8 +732,10 @@ def process_pair(pair, interval, atr_period, risk_mult, reward_ratio):
         if df.empty:
             return None
 
-        # ---- Use per-pair model or fallback to rule ----
-        ml_signal, ml_conf, model_type = pair_model_manager.predict(pair, df)
+        # ---- Strip =X before using as model key ----
+        base_pair = pair.replace('=X', '')
+        ml_signal, ml_conf, model_type = pair_model_manager.predict(base_pair, df)
+
         if model_type != 'rule' and ml_signal is not None and ml_conf >= MIN_CONFIDENCE:
             signal = ml_signal
             confidence = ml_conf
@@ -728,6 +771,10 @@ def process_pair(pair, interval, atr_period, risk_mult, reward_ratio):
             sl, tp = None, None
             can_trade = False
             reason = "No signal"
+
+        # Log prediction for performance monitoring
+        if signal != 'HOLD' and confidence >= MIN_CONFIDENCE:
+            log_prediction(pair, signal, confidence, reference_price, tp, sl)
 
         chart_data = {
             "dates": [str(d) for d in df.index[-100:]],
@@ -902,7 +949,6 @@ def retrain_all_pairs():
             continue
         print(f"🔄 Retraining {pair} with {model_type}...")
         try:
-            # Ensure the pair has '=X' for Yahoo Finance
             yf_pair = pair if '=X' in pair else pair + '=X'
             df = fetch_data(yf_pair, start, end, '1d')
             if df.empty:
@@ -930,8 +976,11 @@ def retrain_all_pairs():
 
 def auto_retrain_loop():
     global auto_retrain_running
+    # Wait 5 minutes before first run to avoid startup congestion
+    time.sleep(60 * 5)
     while AUTO_RETRAIN_ENABLED:
         if auto_retrain_running:
+            retrain_all_pairs()
             time.sleep(RETRAIN_INTERVAL_DAYS * 24 * 3600)
         else:
             auto_retrain_running = True
@@ -946,7 +995,90 @@ def start_auto_retrain_thread():
     if auto_retrain_thread is None or not auto_retrain_thread.is_alive():
         auto_retrain_thread = threading.Thread(target=auto_retrain_loop, daemon=True)
         auto_retrain_thread.start()
-        print(f"🚀 Auto-retraining thread started (interval: {RETRAIN_INTERVAL_DAYS} days).")
+        print(f"🚀 Auto-retraining thread started (interval: {RETRAIN_INTERVAL_DAYS} days, first run in 5 min).")
+
+# ---------- Pre-training data quality check ----------
+def check_data_quality(df, pair):
+    """Return a diagnostic dict for the given DataFrame."""
+    results = {
+        "pair": pair,
+        "missing_values": {},
+        "outliers_count": 0,
+        "max_z_score": 0.0,
+        "class_distribution": {},
+        "hold_percentage": 0.0,
+        "warning": None,
+        "close_range": [float(df['close'].min()), float(df['close'].max())],
+        "rsi_range": [float(df['rsi_14'].min()), float(df['rsi_14'].max())] if 'rsi_14' in df else None,
+        "price_drift": None,
+        "drift_warning": None
+    }
+
+    # 1. Missing values
+    missing = df.isnull().sum()
+    if missing.sum() > 0:
+        results["missing_values"] = missing[missing>0].to_dict()
+
+    # 2. Outliers in returns
+    ret = df['close'].pct_change().dropna()
+    if len(ret) > 1:
+        z_scores = np.abs((ret - ret.mean()) / ret.std())
+        outliers = z_scores > 3
+        results["outliers_count"] = int(outliers.sum())
+        results["max_z_score"] = float(z_scores.max()) if len(z_scores) > 0 else 0.0
+
+    # 3. Class balance
+    future_ret = df['close'].shift(-1) / df['close'] - 1
+    labels = np.where(future_ret > 0.001, 1, np.where(future_ret < -0.001, -1, 0))
+    labels = labels[:-1]  # last row has no future
+    unique, counts = np.unique(labels, return_counts=True)
+    results["class_distribution"] = dict(zip(map(int, unique), map(int, counts)))
+    if len(labels) > 0:
+        hold_pct = counts[0] / len(labels) if 0 in unique else 0.0
+        results["hold_percentage"] = float(hold_pct)
+        if hold_pct > 0.8:
+            results["warning"] = "Over 80% 'HOLD' – model may ignore rare signals."
+
+    # 4. Data drift (split in half)
+    if len(df) > 200:
+        split = len(df) // 2
+        early = df.iloc[:split]
+        late = df.iloc[split:]
+        drift = abs(early['close'].mean() - late['close'].mean()) / early['close'].mean()
+        results["price_drift"] = float(drift)
+        if drift > 0.1:
+            results["drift_warning"] = "Significant price level change – consider retraining more frequently."
+
+    return results
+
+# ---------- Performance monitoring and auto-retraining trigger ----------
+def check_performance_and_retrain():
+    """Query last 50 predictions, compute win rate, trigger retrain if below threshold."""
+    ok, data = supabase_request('GET', 'predictions?actual_outcome=not.is.null&order=created_at.desc&limit=50')
+    if not ok or not data:
+        return {"message": "Not enough data"}
+    wins = sum(1 for r in data if r['actual_outcome'] == 'win')
+    win_rate = wins / len(data) if data else 0.0
+    threshold = 0.45
+    if win_rate < threshold:
+        # Trigger retraining asynchronously
+        threading.Thread(target=retrain_all_pairs).start()
+        return {"message": f"Win rate {win_rate:.2f} below {threshold:.2f}, retraining triggered"}
+    else:
+        return {"message": f"Win rate {win_rate:.2f} OK"}
+
+def performance_monitor_loop():
+    """Background thread to check performance every 24 hours."""
+    while True:
+        time.sleep(86400)  # 24 hours
+        try:
+            with app.app_context():
+                # We'll just call the function directly
+                print("⏰ Running performance check...")
+                result = check_performance_and_retrain()
+                print(f"Performance check result: {result}")
+        except Exception as e:
+            print(f"Performance monitor error: {e}")
 
 # ---------- Flask Routes ----------
 @app.route('/')
@@ -1063,7 +1195,6 @@ def retrain_model():
         return jsonify({"success": False, "error": "Rule-based model cannot be retrained"})
     end = datetime.now().strftime('%Y-%m-%d')
     start = (datetime.now() - timedelta(days=RETRAIN_DATA_DAYS)).strftime('%Y-%m-%d')
-    # Ensure pair has '=X' for Yahoo
     yf_pair = pair if '=X' in pair else pair + '=X'
     df = fetch_data(yf_pair, start, end, '1d')
     if df.empty:
@@ -1093,6 +1224,49 @@ def retrain_status():
         "running": auto_retrain_running
     })
 
+@app.route('/api/check_data', methods=['POST'])
+def check_data_route():
+    """Run pre-training data quality checks for a given pair."""
+    data = request.get_json()
+    if not data or 'pair' not in data:
+        return jsonify({"error": "Missing 'pair' parameter"}), 400
+
+    pair = data['pair']
+    days = int(data.get('days', 730))
+
+    end = datetime.now().strftime('%Y-%m-%d')
+    start = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+
+    try:
+        df = yf.download(pair, start=start, end=end, progress=False, auto_adjust=False)
+        if df.empty:
+            return jsonify({"error": "No data fetched for this pair"}), 400
+
+        # Normalise column names to lower case
+        df.columns = [c.lower() for c in df.columns]
+
+        # Ensure required columns exist
+        required = ['open', 'high', 'low', 'close']
+        if not all(col in df.columns for col in required):
+            return jsonify({"error": "Missing OHLC data"}), 400
+
+        # Compute minimal features for checks
+        df['rsi_14'] = ta.rsi(df['close'], length=14)
+        df['atr_14'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+        df = df.dropna()
+
+        report = check_data_quality(df, pair)
+        return jsonify(report)
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/check_performance', methods=['GET'])
+def check_performance_route():
+    """Endpoint to check model performance and trigger retrain if needed."""
+    result = check_performance_and_retrain()
+    return jsonify(result)
+
 # ---------- Startup ----------
 if __name__ == '__main__':
     init_db()
@@ -1113,6 +1287,14 @@ if __name__ == '__main__':
         print(f"✅ yfinance works: fetched {len(test_data)} bars for {test_pair}")
     else:
         print(f"❌ yfinance failed for {test_pair}. Check internet connection and package.")
+
+    # Start auto-retraining thread (with a 5-min delay)
     start_auto_retrain_thread()
+
+    # Start performance monitor thread
+    monitor_thread = threading.Thread(target=performance_monitor_loop, daemon=True)
+    monitor_thread.start()
+    print("🚀 Performance monitor thread started (checks every 24h).")
+
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)

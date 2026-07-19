@@ -497,6 +497,37 @@ def backtest_pair(pair, start, end, interval, train_end, test_start, model_type=
         'model_acc': acc if model_type != 'rule' else 0.0
     }
 
+# ---------- Walk‑Forward Validation ----------
+def walk_forward_backtest(pair, start, end, interval, train_window_days, test_window_days, model_type='rule'):
+    """Rolling walk‑forward validation."""
+    all_results = []
+    current_start = pd.to_datetime(start)
+    end_date = pd.to_datetime(end)
+    
+    while current_start + timedelta(days=train_window_days + test_window_days) <= end_date:
+        train_end = current_start + timedelta(days=train_window_days)
+        test_end = train_end + timedelta(days=test_window_days)
+        
+        print(f"\n=== Window: {current_start.date()} → {train_end.date()} (train), {train_end.date()} → {test_end.date()} (test)")
+        res = backtest_pair(pair,
+                            current_start.strftime('%Y-%m-%d'),
+                            test_end.strftime('%Y-%m-%d'),
+                            interval,
+                            train_end.strftime('%Y-%m-%d'),
+                            train_end.strftime('%Y-%m-%d'),  # test start = train end
+                            model_type=model_type)
+        if res:
+            all_results.append(res)
+        # move window forward by test_window_days
+        current_start += timedelta(days=test_window_days)
+    
+    if all_results:
+        df = pd.DataFrame(all_results)
+        avg = df[['trades','win_rate','total_pnl']].mean()
+        print(f"\n📊 Average over {len(all_results)} windows: {avg.to_dict()}")
+        return df
+    return None
+
 # ---------- Run for all models and pairs ----------
 if __name__ == '__main__':
     print("==== BACKTEST: Rule vs XGBoost vs RF vs SVM+HMM ====")
@@ -523,3 +554,9 @@ if __name__ == '__main__':
     pivot = df_results.pivot(index='pair', columns='model', values=['trades', 'win_rate', 'total_pnl', 'model_acc'])
     pivot.columns = ['_'.join(col).strip() for col in pivot.columns.values]
     print(pivot.to_string())
+
+    # Optional: run walk‑forward for a selected model/pair
+    # Example:
+    # print("\n\n==== WALK‑FORWARD VALIDATION (XGBoost on EURUSD) ====")
+    # walk_forward_backtest('EURUSD=X', START_DATE, END_DATE, INTERVAL,
+    #                       train_window_days=365, test_window_days=90, model_type='xgboost')
