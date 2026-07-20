@@ -13,6 +13,7 @@ import pandas_ta as ta
 from dotenv import load_dotenv
 from candlestick_patterns import detect_candlestick_patterns, get_pattern_signal
 from chart_patterns import detect_chart_patterns
+from pattern_model import PatternModel
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -37,11 +38,6 @@ PYTRADER_SERVER = os.environ.get('PYTRADER_SERVER', 'localhost')
 PYTRADER_PORT = int(os.environ.get('PYTRADER_PORT', 1122))
 PYTRADER_AUTH_CODE = os.environ.get('PYTRADER_AUTH_CODE', 'None')
 TRADE_VOLUME = float(os.environ.get('TRADE_VOLUME', 0.01))
-
-# ---------- Auto-retraining configuration ----------
-AUTO_RETRAIN_ENABLED = os.environ.get('AUTO_RETRAIN_ENABLED', 'True').lower() == 'true'
-RETRAIN_INTERVAL_DAYS = int(os.environ.get('RETRAIN_INTERVAL_DAYS', 7))
-RETRAIN_DATA_DAYS = int(os.environ.get('RETRAIN_DATA_DAYS', 730))
 
 # ---------- Twelve Data ----------
 TWELVE_DATA_API_KEY = os.environ.get('TWELVE_DATA_API_KEY')
@@ -120,6 +116,25 @@ def supabase_request(method, endpoint, data=None):
     except Exception as e:
         return False, str(e)
 
+# Test Supabase write
+try:
+    test_data = {
+        'pair': 'TEST',
+        'signal': 'BUY',
+        'entry_price': 1.0,
+        'tp': 1.1,
+        'sl': 0.9,
+        'result': 'pending',
+        'pnl': 0.0
+    }
+    ok, _ = supabase_request('POST', 'trades', test_data)
+    if ok:
+        print("✅ Supabase write test successful")
+    else:
+        print("❌ Supabase write test failed – but continuing.")
+except Exception as e:
+    print(f"❌ Supabase write test exception: {e}")
+
 # ---------- PyTrader state ----------
 pytrader = None
 pytrader_connected = False
@@ -132,7 +147,7 @@ auto_trade_thread = None
 auto_trade_lock = threading.Lock()
 auto_trade_pairs = AUTO_TRADE_PAIRS
 
-# ---------- ML Model Manager (per‑pair) ----------
+# ---------- ML Model ----------
 class SupabaseClientWrapper:
     def __init__(self, supabase_url, service_key):
         self.base_url = supabase_url
@@ -155,10 +170,6 @@ class TableWrapper:
         self.select_fields = fields
         return self
 
-    def eq(self, column, value):
-        self.filters[column] = value
-        return self
-
     def order(self, column, desc=False):
         self.order_by = column
         self.order_desc = desc
@@ -170,24 +181,19 @@ class TableWrapper:
 
     def execute(self):
         url = self.client.base_url + self.table_name
-        params = []
+        params = {}
         if self.select_fields != '*':
-            params.append(f"select={self.select_fields}")
-        for col, val in self.filters.items():
-            params.append(f"{col}=eq.{val}")
+            params['select'] = self.select_fields
         if self.order_by:
-            params.append(f"order={self.order_by}.{'desc' if self.order_desc else 'asc'}")
+            params['order'] = f'{self.order_by}.desc' if self.order_desc else f'{self.order_by}.asc'
         if self.limit_val:
-            params.append(f"limit={self.limit_val}")
-        if params:
-            url += '?' + '&'.join(params)
-
+            params['limit'] = self.limit_val
         headers = {
             "apikey": self.client.key,
             "Authorization": f"Bearer {self.client.key}",
             "Content-Type": "application/json"
         }
-        resp = requests.get(url, headers=headers)
+        resp = requests.get(url, params=params, headers=headers)
         if resp.status_code == 200:
             class Response:
                 def __init__(self, data):
@@ -230,224 +236,46 @@ class TableWrapper:
             return Response()
 
 supabase_wrapper = SupabaseClientWrapper(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+pattern_model = PatternModel(supabase_wrapper)
 
-# ---------- Per-Pair Model Configuration (UPDATED: EURUSD → rf) ----------
-PAIR_MODEL_TYPES = {
-    'AUDUSD': 'rule',
-    'EURUSD': 'rf',          # <-- changed from 'xgboost'
-    'GBPUSD': 'rf',
-    'USDCAD': 'xgboost',
-}
+# ---------- Connection ----------
+def connect_to_mt4():
+    global pytrader, pytrader_connected, last_connection_attempt
+    if not PYTRADER_AVAILABLE:
+        return False
+    now = time.time()
+    if now - last_connection_attempt < connection_attempt_interval and not pytrader_connected:
+        return False
+    last_connection_attempt = now
 
-from pattern_model import PairModelManager
-pair_model_manager = PairModelManager(supabase_wrapper)
+    default_pairs = [
+        'EURUSD', 'USDJPY', 'GBPUSD', 'AUDUSD', 'USDCAD',
+        'EURCHF', 'EURGBP', 'AUDCHF', 'NZDCHF', 'GBPNZD'
+    ]
+    instrument_lookup = {pair: pair for pair in default_pairs}
 
-for pair, model_type in PAIR_MODEL_TYPES.items():
-    if model_type != 'rule':
-        pair_model_manager.load_model(pair, model_type)
-    else:
-        pair_model_manager.models[pair] = {'type': 'rule', 'model': None, 'scaler': None}
-
-print("✅ Per‑pair models loaded.")
-
-# ---------- Data Fetch & Feature Functions ----------
-def get_date_ranges():
-    now = datetime.now()
-    recent_end = now.strftime("%Y-%m-%d")
-    # Use 60 days to ensure enough data for rule-based pattern detection
-    recent_start = (now - timedelta(days=60)).strftime("%Y-%m-%d")
-    return recent_start, recent_end
-
-def fetch_data(pair, start, end, interval):
-    """
-    Fetch data for a given pair. Tries both the provided symbol and the version with '=X'.
-    """
-    print(f"📊 Fetching {pair} ({interval}) from {start} to {end}...")
-    symbols_to_try = [pair]
-    if '=X' not in pair:
-        symbols_to_try.append(pair + '=X')
-    else:
-        symbols_to_try.append(pair.replace('=X', ''))
-    data = pd.DataFrame()
-    for ticker in symbols_to_try:
-        try:
-            data = yf.download(
-                ticker,
-                start=start,
-                end=end,
-                interval=interval,
-                progress=False,
-                timeout=60,
-                auto_adjust=False,
-                threads=True,
-                ignore_tz=True
-            )
-            if not data.empty:
-                print(f"✅ {pair}: {len(data)} bars ({interval}) using {ticker}")
-                if 'Adj Close' in data.columns:
-                    data = data.drop(columns=['Adj Close'])
-                data.columns = ['open', 'high', 'low', 'close', 'volume']
-                return data
-        except Exception as e:
-            print(f"⚠️ {ticker} failed: {e}")
-            continue
-    # Fallback to daily if interval not '1d'
-    if interval != '1d':
-        print(f"📊 {pair}: falling back to daily...")
-        for ticker in symbols_to_try:
-            try:
-                data = yf.download(
-                    ticker,
-                    start=start,
-                    end=end,
-                    interval='1d',
-                    progress=False,
-                    timeout=60,
-                    auto_adjust=False
-                )
-                if not data.empty:
-                    print(f"✅ {pair}: {len(data)} daily bars using {ticker}")
-                    if 'Adj Close' in data.columns:
-                        data = data.drop(columns=['Adj Close'])
-                    data.columns = ['open', 'high', 'low', 'close', 'volume']
-                    return data
-            except Exception as e:
-                continue
-    print(f"❌ No data for {pair} after all attempts.")
-    return pd.DataFrame()
-
-def add_features(df):
-    if df.empty:
-        return df
-    df = df.copy()
-    if len(df) < 20:
-        return pd.DataFrame()
-    df['rsi_14'] = ta.rsi(df['close'], length=14)
-    macd_df = ta.macd(df['close'], fast=12, slow=26, signal=9)
-    if macd_df is not None and not macd_df.empty:
-        df['macd'] = macd_df.get('MACD_12_26_9', macd_df.get('MACD', 0))
-    else:
-        df['macd'] = 0
-    df['atr_14'] = ta.atr(df['high'], df['low'], df['close'], length=14)
-    sma = df['close'].rolling(20).mean()
-    std = df['close'].rolling(20).std()
-    df['bb_upper'] = sma + 2 * std
-    df['bb_middle'] = sma
-    df['bb_lower'] = sma - 2 * std
-    df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['bb_middle']
-    df['bb_width'] = df['bb_width'].replace([np.inf, -np.inf], np.nan)
-    df['roc_10'] = ta.roc(df['close'], length=10)
-    df['roc_20'] = ta.roc(df['close'], length=20)
-    ret = df['close'].pct_change()
-    df['returns_std_10'] = ret.rolling(10).std()
-    df['returns_skew_10'] = ret.rolling(10).skew()
-    df['returns_kurt_10'] = ret.rolling(10).kurt()
-    for lag in [1, 2]:
-        df[f'open_prev_{lag}'] = df['open'].shift(lag)
-        df[f'high_prev_{lag}'] = df['high'].shift(lag)
-        df[f'low_prev_{lag}'] = df['low'].shift(lag)
-        df[f'close_prev_{lag}'] = df['close'].shift(lag)
-    df = df.replace([np.inf, -np.inf], np.nan)
-    df = df.dropna()
-    return df
-
-# ---------- Pattern detection (rule-based) ----------
-def detect_support_resistance(df, window=20):
     try:
-        high = df['high']
-        low = df['low']
-        piv_high = high[(high.shift(1) < high) & (high.shift(-1) < high)]
-        piv_low = low[(low.shift(1) > low) & (low.shift(-1) > low)]
-        if len(piv_high) == 0 or len(piv_low) == 0:
-            return None, None
-        current = df['close'].iloc[-1]
-        support = piv_low[piv_low < current].max() if any(piv_low < current) else None
-        resistance = piv_high[piv_high > current].min() if any(piv_high > current) else None
-        return support, resistance
-    except:
-        return None, None
-
-def detect_trend(df, ma_short=20, ma_long=50):
-    try:
-        if len(df) < ma_long:
-            return 'neutral'
-        sma_short = df['close'].rolling(ma_short).mean().iloc[-1]
-        sma_long = df['close'].rolling(ma_long).mean().iloc[-1]
-        short_slope = df['close'].rolling(ma_short).mean().diff(5).iloc[-1]
-        if sma_short > sma_long and short_slope > 0:
-            return 'uptrend'
-        elif sma_short < sma_long and short_slope < 0:
-            return 'downtrend'
+        pytrader = Pytrader_API()
+        pytrader.debug = False
+        success = pytrader.Connect(
+            server=PYTRADER_SERVER,
+            port=PYTRADER_PORT,
+            instrument_lookup=instrument_lookup,
+            authorization_code=PYTRADER_AUTH_CODE
+        )
+        if success:
+            pytrader_connected = True
+            print("✅ Connected to MT4 via PyTrader.")
+            return True
         else:
-            return 'neutral'
-    except:
-        return 'neutral'
+            print("❌ PyTrader connection failed.")
+            pytrader_connected = False
+            return False
+    except Exception as e:
+        print(f"❌ PyTrader connection error: {e}")
+        pytrader_connected = False
+        return False
 
-def detect_breakout(df, lookback=20, threshold=0.002):
-    try:
-        high = df['high'].iloc[-lookback:-1].max()
-        low = df['low'].iloc[-lookback:-1].min()
-        curr_close = df['close'].iloc[-1]
-        if curr_close > high * (1 + threshold):
-            return 'breakout_up'
-        elif curr_close < low * (1 - threshold):
-            return 'breakout_down'
-        else:
-            return None
-    except:
-        return None
-
-def compute_pattern_signal(df):
-    candle_patterns = detect_candlestick_patterns(df)
-    candle_signal, candle_conf = get_pattern_signal(candle_patterns)
-    chart_patterns = detect_chart_patterns(df, lookback=40) if len(df) >= 40 else []
-    support, resistance = detect_support_resistance(df)
-    trend = detect_trend(df)
-    breakout = detect_breakout(df)
-    if candle_signal != 'HOLD':
-        signal = candle_signal
-        confidence = candle_conf
-        for pat in chart_patterns:
-            if pat in ['double_bottom', 'inverse_head_shoulders', 'ascending_triangle'] and signal == 'BUY':
-                confidence = min(1.0, confidence + 0.15)
-            elif pat in ['double_top', 'head_shoulders', 'descending_triangle'] and signal == 'SELL':
-                confidence = min(1.0, confidence + 0.15)
-        if signal == 'BUY' and trend == 'uptrend':
-            confidence = min(1.0, confidence + 0.1)
-        elif signal == 'SELL' and trend == 'downtrend':
-            confidence = min(1.0, confidence + 0.1)
-    else:
-        if chart_patterns:
-            bullish_pats = ['double_bottom', 'inverse_head_shoulders', 'ascending_triangle', 'falling_wedge']
-            bearish_pats = ['double_top', 'head_shoulders', 'descending_triangle', 'rising_wedge']
-            bullish = sum(1 for p in chart_patterns if p in bullish_pats)
-            bearish = sum(1 for p in chart_patterns if p in bearish_pats)
-            if bullish > bearish:
-                signal = 'BUY'
-                confidence = 0.5 + 0.3 * (bullish / (bullish + bearish + 1e-6))
-            elif bearish > bullish:
-                signal = 'SELL'
-                confidence = 0.5 + 0.3 * (bearish / (bullish + bearish + 1e-6))
-            else:
-                signal = 'HOLD'
-                confidence = 0.0
-            if signal == 'BUY' and trend == 'uptrend':
-                confidence = min(1.0, confidence + 0.2)
-            elif signal == 'SELL' and trend == 'downtrend':
-                confidence = min(1.0, confidence + 0.2)
-        else:
-            signal = 'HOLD'
-            confidence = 0.0
-    if signal != 'HOLD':
-        if signal == 'BUY' and trend == 'downtrend':
-            signal = 'HOLD'
-            confidence = 0.0
-        elif signal == 'SELL' and trend == 'uptrend':
-            signal = 'HOLD'
-            confidence = 0.0
-    return signal, confidence
-
-# ---------- SL/TP calculations ----------
 def get_live_entry_price(pair, signal):
     symbol = pair.replace('=X', '')
     price = get_live_price_twelve(symbol)
@@ -470,6 +298,7 @@ def get_live_entry_price(pair, signal):
         print(f"⚠️ PyTrader error for {pair}: {e}")
     return None, False
 
+# ---------- Volume & SL/TP ----------
 def get_valid_lot_size(pair, requested_volume):
     global pytrader, pytrader_connected
     if not pytrader_connected:
@@ -565,17 +394,7 @@ def validate_sl_tp(pair, price, sl, tp):
         return False, "SL and TP on same side of price"
     return True, "OK"
 
-def compute_tp_sl(price, atr, signal, risk_atr=RISK_ATR, reward_ratio=REWARD_RATIO):
-    risk = atr * risk_atr
-    if signal == 'BUY':
-        sl = price - risk
-        tp = price + risk * reward_ratio
-    else:
-        sl = price + risk
-        tp = price - risk * reward_ratio
-    return sl, tp
-
-# ---------- Supabase helpers ----------
+# ---------- Supabase Helpers ----------
 def table_exists(table_name):
     ok, _ = supabase_request('GET', table_name + '?limit=1')
     return ok
@@ -584,7 +403,7 @@ def init_db():
     if not table_exists('trades') or not table_exists('config'):
         print("\n⚠️  Tables 'trades' and/or 'config' are missing.")
         print("Please create them manually in your Supabase SQL Editor with:")
-        print(""" 
+        print("""
 CREATE TABLE IF NOT EXISTS trades (
     id SERIAL PRIMARY KEY,
     timestamp TIMESTAMP DEFAULT NOW(),
@@ -612,44 +431,19 @@ CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp);
     else:
         print("✅ Tables 'trades' and 'config' already exist.")
 
-    if not table_exists('pair_models'):
-        print("\n⚠️  Table 'pair_models' does not exist.")
+    if not table_exists('pattern_models'):
+        print("\n⚠️  Table 'pattern_models' does not exist.")
         print("Please create it manually in your Supabase SQL Editor with:")
-        print(""" 
-CREATE TABLE IF NOT EXISTS pair_models (
+        print("""
+CREATE TABLE IF NOT EXISTS pattern_models (
     id SERIAL PRIMARY KEY,
-    pair TEXT NOT NULL,
-    model_type TEXT NOT NULL,
-    model_blob TEXT NOT NULL,
     created_at TIMESTAMP DEFAULT NOW(),
     version TEXT,
-    metrics JSONB
-);
-CREATE INDEX IF NOT EXISTS idx_pair_model ON pair_models(pair, model_type, created_at DESC);
-        """)
-    else:
-        print("✅ Table 'pair_models' already exists.")
-
-    # New table for prediction logging
-    if not table_exists('predictions'):
-        print("\n⚠️  Table 'predictions' does not exist. Creating...")
-        print("Please run the following SQL to create it:")
-        print(""" 
-CREATE TABLE IF NOT EXISTS predictions (
-    id SERIAL PRIMARY KEY,
-    pair TEXT,
-    signal TEXT,
-    confidence FLOAT,
-    entry_price FLOAT,
-    predicted_tp FLOAT,
-    predicted_sl FLOAT,
-    actual_outcome TEXT,
-    actual_pnl FLOAT,
-    created_at TIMESTAMP DEFAULT NOW()
+    model_blob TEXT
 );
         """)
     else:
-        print("✅ Table 'predictions' already exists.")
+        print("✅ Table 'pattern_models' already exists.")
 
 def get_min_confidence():
     ok, result = supabase_request('GET', 'config?key=eq.min_confidence')
@@ -675,25 +469,6 @@ def log_trade(pair, signal, price, tp, sl, result, pnl):
     if not ok:
         print(f"Could not log trade: {_}")
 
-def log_prediction(pair, signal, confidence, price, tp, sl):
-    data = {
-        'pair': pair,
-        'signal': signal,
-        'confidence': confidence,
-        'entry_price': price,
-        'predicted_tp': tp,
-        'predicted_sl': sl,
-        'actual_outcome': None,
-        'actual_pnl': None,
-        'created_at': datetime.now().isoformat()
-    }
-    ok, _ = supabase_request('POST', 'predictions', data)
-    if not ok:
-        print(f"Could not log prediction: {_}")
-
-def update_prediction_outcome(prediction_id, outcome, pnl):
-    supabase_request('PATCH', f'predictions?id=eq.{prediction_id}', {'actual_outcome': outcome, 'actual_pnl': pnl})
-
 def update_trade_result(trade_id, result, pnl):
     supabase_request('PATCH', f'trades?id=eq.{trade_id}', {'result': result, 'pnl': pnl})
 
@@ -715,7 +490,293 @@ def update_confidence_threshold():
     except Exception as e:
         print(f"Error updating confidence threshold: {e}")
 
-# ---------- Main process_pair (with per-pair model) ----------
+# ---------- Pattern Recognition ----------
+def get_date_ranges():
+    now = datetime.now()
+    recent_end = now.strftime("%Y-%m-%d")
+    recent_start = (now - timedelta(days=30)).strftime("%Y-%m-%d")
+    return recent_start, recent_end
+
+def fetch_data(pair, start, end, interval):
+    print(f"📊 Fetching {pair} ({interval}) from {start} to {end}...")
+    data = pd.DataFrame()
+    try:
+        data = yf.download(
+            pair,
+            start=start,
+            end=end,
+            interval=interval,
+            progress=False,
+            timeout=60,
+            auto_adjust=False,
+            threads=True,
+            ignore_tz=True
+        )
+        if not data.empty:
+            print(f"✅ {pair}: {len(data)} bars ({interval})")
+            if 'Adj Close' in data.columns:
+                data = data.drop(columns=['Adj Close'])
+            data.columns = ['open', 'high', 'low', 'close', 'volume']
+            return data
+    except Exception as e:
+        print(f"❌ {pair} ({interval}) error: {e}")
+    try:
+        print(f"📊 {pair}: falling back to daily...")
+        data = yf.download(
+            pair,
+            start=start,
+            end=end,
+            interval='1d',
+            progress=False,
+            timeout=60
+        )
+        if not data.empty:
+            print(f"✅ {pair}: {len(data)} daily bars")
+            if 'Adj Close' in data.columns:
+                data = data.drop(columns=['Adj Close'])
+            data.columns = ['open', 'high', 'low', 'close', 'volume']
+            return data
+    except Exception as e:
+        print(f"❌ {pair} daily fallback error: {e}")
+    try:
+        print(f"📊 {pair}: trying with period='1mo'...")
+        data = yf.download(
+            pair,
+            period='1mo',
+            interval='1h',
+            progress=False,
+            timeout=60
+        )
+        if not data.empty:
+            print(f"✅ {pair}: {len(data)} bars (period='1mo')")
+            if 'Adj Close' in data.columns:
+                data = data.drop(columns=['Adj Close'])
+            data.columns = ['open', 'high', 'low', 'close', 'volume']
+            return data
+    except Exception as e:
+        print(f"❌ {pair} period fallback error: {e}")
+    print(f"❌ No data for {pair} after all attempts.")
+    return pd.DataFrame()
+
+def detect_support_resistance(df, window=20):
+    try:
+        high = df['high']
+        low = df['low']
+        piv_high = high[(high.shift(1) < high) & (high.shift(-1) < high)]
+        piv_low = low[(low.shift(1) > low) & (low.shift(-1) > low)]
+        if len(piv_high) == 0 or len(piv_low) == 0:
+            return None, None
+        current = df['close'].iloc[-1]
+        support = piv_low[piv_low < current].max() if any(piv_low < current) else None
+        resistance = piv_high[piv_high > current].min() if any(piv_high > current) else None
+        return support, resistance
+    except:
+        return None, None
+
+def detect_trend(df, ma_short=20, ma_long=50):
+    try:
+        if len(df) < ma_long:
+            return 'neutral'
+        sma_short = df['close'].rolling(ma_short).mean().iloc[-1]
+        sma_long = df['close'].rolling(ma_long).mean().iloc[-1]
+        short_slope = df['close'].rolling(ma_short).mean().diff(5).iloc[-1]
+        if sma_short > sma_long and short_slope > 0:
+            return 'uptrend'
+        elif sma_short < sma_long and short_slope < 0:
+            return 'downtrend'
+        else:
+            return 'neutral'
+    except:
+        return 'neutral'
+
+def detect_breakout(df, lookback=20, threshold=0.002):
+    try:
+        high = df['high'].iloc[-lookback:-1].max()
+        low = df['low'].iloc[-lookback:-1].min()
+        curr_close = df['close'].iloc[-1]
+        if curr_close > high * (1 + threshold):
+            return 'breakout_up'
+        elif curr_close < low * (1 - threshold):
+            return 'breakout_down'
+        else:
+            return None
+    except:
+        return None
+
+# ---------- Profit Calculation Helpers ----------
+def get_pip_value(pair, volume=1.0):
+    """Return dollars per pip for a given pair and volume (standard lot = 1.0)."""
+    global pytrader, pytrader_connected
+    if pytrader_connected and pair in pytrader.instrument_conversion_list:
+        info = pytrader.Get_instrument_info(pair)
+        if info:
+            tick_size = info.get('tick_size')
+            tick_value = info.get('tick_value')  # per standard lot
+            if tick_size and tick_value:
+                # dollars per point * volume
+                return tick_value / tick_size * volume
+    # Fallback approximations
+    if pair.endswith('JPY'):
+        pip_size = 0.01
+    else:
+        pip_size = 0.0001
+    # Standard lot (1.0) = $10 per pip, so dollars per pip = 10 * volume
+    return 10.0 * volume
+
+def compute_profit(entry, exit_price, pair, volume):
+    """Return dollar profit/loss for a trade from entry to exit."""
+    global pytrader, pytrader_connected
+    if pytrader_connected and pair in pytrader.instrument_conversion_list:
+        info = pytrader.Get_instrument_info(pair)
+        if info:
+            tick_size = info.get('tick_size')
+            tick_value = info.get('tick_value')  # per standard lot
+            if tick_size and tick_value:
+                diff = exit_price - entry
+                profit = (diff / tick_size) * tick_value * volume
+                return profit
+    # Fallback
+    if pair.endswith('JPY'):
+        pip_size = 0.01
+    else:
+        pip_size = 0.0001
+    pips = (exit_price - entry) / pip_size
+    profit = pips * 10.0 * volume
+    return profit
+
+# ---------- Model Retraining ----------
+_retraining_lock = threading.Lock()
+_retraining_thread = None
+_auto_retrain_enabled = True
+_RETRAIN_INTERVAL_HOURS = 6
+_RETRAIN_PAIRS = ['EURUSD=X', 'GBPUSD=X', 'AUDUSD=X', 'USDCAD=X']
+_TRAINING_BARS = 2000
+
+def retrain_model():
+    """Fetch fresh data and retrain the SVM+HMM model."""
+    with _retraining_lock:
+        print("🔄 Starting model retraining...")
+        try:
+            all_dfs = []
+            for pair in _RETRAIN_PAIRS:
+                end = datetime.now()
+                start = end - timedelta(days=90)  # enough for ~2000 hourly bars
+                df = fetch_data(pair, start.strftime('%Y-%m-%d'), end.strftime('%Y-%m-%d'), '1h')
+                if not df.empty:
+                    # Keep the timestamp as a column and reset index to get a clean integer index
+                    df = df.reset_index()  # 'index' column becomes timestamp
+                    all_dfs.append(df)
+            if not all_dfs:
+                print("❌ No data for retraining.")
+                return False
+
+            # Concatenate all DataFrames with a unique integer index
+            combined = pd.concat(all_dfs, ignore_index=True)
+            # The timestamp is in the 'index' column; we don't need it for training
+            combined = combined.drop(columns=['index']) if 'index' in combined.columns else combined
+
+            success = pattern_model.train(combined)
+            if success:
+                print("✅ Model retrained successfully.")
+            else:
+                print("❌ Retraining failed.")
+            return success
+        except Exception as e:
+            print(f"❌ Retraining error: {e}")
+            traceback.print_exc()
+            return False
+
+def auto_retrain_loop():
+    while True:
+        if _auto_retrain_enabled:
+            retrain_model()
+        time.sleep(_RETRAIN_INTERVAL_HOURS * 3600)
+
+def start_auto_retrain_thread():
+    global _retraining_thread
+    if _retraining_thread is None or not _retraining_thread.is_alive():
+        _retraining_thread = threading.Thread(target=auto_retrain_loop, daemon=True)
+        _retraining_thread.start()
+        print("🚀 Auto‑retrain thread started.")
+
+# ---------- Main Signal Processing ----------
+def compute_pattern_signal(df):
+    ml_signal, ml_confidence = pattern_model.predict_pattern(df)
+    if ml_confidence > 0.55 and ml_signal != 'HOLD':
+        signal = ml_signal
+        confidence = ml_confidence
+    else:
+        candle_patterns = detect_candlestick_patterns(df)
+        candle_signal, candle_conf = get_pattern_signal(candle_patterns)
+        chart_patterns = detect_chart_patterns(df, lookback=40) if len(df) >= 40 else []
+        support, resistance = detect_support_resistance(df)
+        trend = detect_trend(df)
+        breakout = detect_breakout(df)
+        if candle_signal != 'HOLD':
+            signal = candle_signal
+            confidence = candle_conf
+            for pat in chart_patterns:
+                if pat in ['double_bottom', 'inverse_head_shoulders', 'ascending_triangle'] and signal == 'BUY':
+                    confidence = min(1.0, confidence + 0.15)
+                elif pat in ['double_top', 'head_shoulders', 'descending_triangle'] and signal == 'SELL':
+                    confidence = min(1.0, confidence + 0.15)
+            if signal == 'BUY' and trend == 'uptrend':
+                confidence = min(1.0, confidence + 0.1)
+            elif signal == 'SELL' and trend == 'downtrend':
+                confidence = min(1.0, confidence + 0.1)
+        else:
+            if chart_patterns:
+                bullish_pats = ['double_bottom', 'inverse_head_shoulders', 'ascending_triangle', 'falling_wedge']
+                bearish_pats = ['double_top', 'head_shoulders', 'descending_triangle', 'rising_wedge']
+                bullish = sum(1 for p in chart_patterns if p in bullish_pats)
+                bearish = sum(1 for p in chart_patterns if p in bearish_pats)
+                if bullish > bearish:
+                    signal = 'BUY'
+                    confidence = 0.5 + 0.3 * (bullish / (bullish + bearish + 1e-6))
+                elif bearish > bullish:
+                    signal = 'SELL'
+                    confidence = 0.5 + 0.3 * (bearish / (bullish + bearish + 1e-6))
+                else:
+                    signal = 'HOLD'
+                    confidence = 0.0
+                if signal == 'BUY' and trend == 'uptrend':
+                    confidence = min(1.0, confidence + 0.2)
+                elif signal == 'SELL' and trend == 'downtrend':
+                    confidence = min(1.0, confidence + 0.2)
+            else:
+                signal = 'HOLD'
+                confidence = 0.0
+    trend = detect_trend(df, ma_short=20, ma_long=200)
+    if signal != 'HOLD':
+        if signal == 'BUY' and trend == 'downtrend':
+            signal = 'HOLD'
+            confidence = 0.0
+        elif signal == 'SELL' and trend == 'uptrend':
+            signal = 'HOLD'
+            confidence = 0.0
+    min_conf = get_min_confidence()
+    if confidence >= min_conf and signal != 'HOLD':
+        final_signal = signal
+    else:
+        final_signal = 'HOLD'
+    details = {
+        'trend': trend,
+        'support': support if 'support' in locals() else None,
+        'resistance': resistance if 'resistance' in locals() else None,
+        'breakout': breakout if 'breakout' in locals() else None
+    }
+    return final_signal, confidence, details
+
+def compute_tp_sl(price, atr, signal, risk_atr=RISK_ATR, reward_ratio=REWARD_RATIO):
+    risk = atr * risk_atr
+    if signal == 'BUY':
+        sl = price - risk
+        tp = price + risk * reward_ratio
+    else:
+        sl = price + risk
+        tp = price - risk * reward_ratio
+    return sl, tp
+
 def process_pair(pair, interval, atr_period, risk_mult, reward_ratio):
     recent_start, recent_end = get_date_ranges()
     print(f"🔍 Processing {pair}...")
@@ -723,58 +784,36 @@ def process_pair(pair, interval, atr_period, risk_mult, reward_ratio):
         df = fetch_data(pair, recent_start, recent_end, interval)
         if df.empty or len(df) < 60:
             return None
-        df = add_features(df)
-        if df.empty:
-            return None
         df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=atr_period)
         df['volatility'] = df['close'].pct_change().rolling(20).std()
         df = df.dropna()
         if df.empty:
             return None
-
-        # ---- Strip =X before using as model key ----
-        base_pair = pair.replace('=X', '')
-        ml_signal, ml_conf, model_type = pair_model_manager.predict(base_pair, df)
-
-        if model_type != 'rule' and ml_signal is not None and ml_conf >= MIN_CONFIDENCE:
-            signal = ml_signal
-            confidence = ml_conf
-            details = {'trend': detect_trend(df), 'support': None, 'resistance': None, 'breakout': None}
-        else:
-            signal, confidence = compute_pattern_signal(df)
-            details = {
-                'trend': detect_trend(df),
-                'support': None,
-                'resistance': None,
-                'breakout': None
-            }
-
+        signal, confidence, details = compute_pattern_signal(df)
         current_atr = df['atr'].iloc[-1]
         live_price, live_ok = get_live_entry_price(pair, signal)
         if live_ok:
             reference_price = live_price
         else:
             reference_price = df['close'].iloc[-1]
-
-        if signal != 'HOLD':
-            raw_sl, raw_tp = compute_tp_sl(reference_price, current_atr, signal,
-                                           risk_atr=risk_mult, reward_ratio=reward_ratio)
-            adjusted_sl, adjusted_tp = adjust_sl_tp(pair, reference_price, raw_sl, raw_tp)
-            if adjusted_sl is None or adjusted_tp is None:
-                can_trade = False
-                reason = "Cannot adjust SL/TP to valid levels"
-                sl, tp = raw_sl, raw_tp
-            else:
-                sl, tp = adjusted_sl, adjusted_tp
-                can_trade, reason = validate_sl_tp(pair, reference_price, sl, tp)
-        else:
-            sl, tp = None, None
+        raw_sl, raw_tp = compute_tp_sl(reference_price, current_atr, signal,
+                                       risk_atr=risk_mult, reward_ratio=reward_ratio)
+        adjusted_sl, adjusted_tp = adjust_sl_tp(pair, reference_price, raw_sl, raw_tp)
+        if adjusted_sl is None or adjusted_tp is None:
             can_trade = False
-            reason = "No signal"
+            reason = "Cannot adjust SL/TP to valid levels"
+            sl, tp = raw_sl, raw_tp
+        else:
+            sl, tp = adjusted_sl, adjusted_tp
+            can_trade, reason = validate_sl_tp(pair, reference_price, sl, tp)
 
-        # Log prediction for performance monitoring
-        if signal != 'HOLD' and confidence >= MIN_CONFIDENCE:
-            log_prediction(pair, signal, confidence, reference_price, tp, sl)
+        # ----- Profit calculation -----
+        volume_for_profit = TRADE_VOLUME
+        tp_profit = None
+        sl_loss = None
+        if signal != 'HOLD' and can_trade:
+            tp_profit = compute_profit(reference_price, tp, pair, volume_for_profit)
+            sl_loss = compute_profit(reference_price, sl, pair, volume_for_profit)
 
         chart_data = {
             "dates": [str(d) for d in df.index[-100:]],
@@ -785,21 +824,21 @@ def process_pair(pair, interval, atr_period, risk_mult, reward_ratio):
                 "signal": signal
             } if signal != "HOLD" else None
         }
-
         return {
             "pair": pair.replace("=X", ""),
             "signal": signal,
-            "confidence": round(confidence, 3) if confidence else 0.0,
+            "confidence": round(confidence, 3),
             "price": round(reference_price, 5),
-            "tp": round(tp, 5) if tp else None,
-            "sl": round(sl, 5) if sl else None,
+            "tp": round(tp, 5),
+            "sl": round(sl, 5),
             "atr": round(current_atr, 5),
             "can_trade": can_trade,
             "can_trade_reason": reason,
             "pattern_details": details,
             "trend": details['trend'],
             "chart": chart_data,
-            "model_used": model_type,
+            "tp_profit": round(tp_profit, 2) if tp_profit is not None else None,
+            "sl_loss": round(sl_loss, 2) if sl_loss is not None else None,
             "error": None
         }
     except Exception as e:
@@ -807,7 +846,6 @@ def process_pair(pair, interval, atr_period, risk_mult, reward_ratio):
         traceback.print_exc()
         return {"pair": pair, "error": str(e)[:100]}
 
-# ---------- Execute trade ----------
 def execute_trade(pair, signal, price, tp, sl, volume=TRADE_VOLUME):
     global pytrader, pytrader_connected
     if not PYTRADER_AVAILABLE:
@@ -855,43 +893,6 @@ def execute_trade(pair, signal, price, tp, sl, volume=TRADE_VOLUME):
         return {"success": False, "error": str(e)}
 
 # ---------- Auto-Trade ----------
-def connect_to_mt4():
-    global pytrader, pytrader_connected, last_connection_attempt
-    if not PYTRADER_AVAILABLE:
-        return False
-    now = time.time()
-    if now - last_connection_attempt < connection_attempt_interval and not pytrader_connected:
-        return False
-    last_connection_attempt = now
-
-    default_pairs = [
-        'EURUSD', 'USDJPY', 'GBPUSD', 'AUDUSD', 'USDCAD',
-        'EURCHF', 'EURGBP', 'AUDCHF', 'NZDCHF', 'GBPNZD'
-    ]
-    instrument_lookup = {pair: pair for pair in default_pairs}
-
-    try:
-        pytrader = Pytrader_API()
-        pytrader.debug = False
-        success = pytrader.Connect(
-            server=PYTRADER_SERVER,
-            port=PYTRADER_PORT,
-            instrument_lookup=instrument_lookup,
-            authorization_code=PYTRADER_AUTH_CODE
-        )
-        if success:
-            pytrader_connected = True
-            print("✅ Connected to MT4 via PyTrader.")
-            return True
-        else:
-            print("❌ PyTrader connection failed.")
-            pytrader_connected = False
-            return False
-    except Exception as e:
-        print(f"❌ PyTrader connection error: {e}")
-        pytrader_connected = False
-        return False
-
 def auto_trade_iteration():
     if not auto_trade_enabled:
         return
@@ -933,152 +934,6 @@ def start_auto_trade_thread():
         auto_trade_thread = threading.Thread(target=auto_trade_loop, daemon=True)
         auto_trade_thread.start()
         print("🚀 Auto-trade thread started (runs every 60s).")
-
-# ---------- Auto-Retraining ----------
-auto_retrain_running = False
-auto_retrain_thread = None
-
-def retrain_all_pairs():
-    print(f"🔄 Starting auto-retraining at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    end = datetime.now().strftime('%Y-%m-%d')
-    start = (datetime.now() - timedelta(days=RETRAIN_DATA_DAYS)).strftime('%Y-%m-%d')
-    results = {}
-    for pair, model_type in PAIR_MODEL_TYPES.items():
-        if model_type == 'rule':
-            print(f"⏭️ Skipping {pair} (rule-based)")
-            continue
-        print(f"🔄 Retraining {pair} with {model_type}...")
-        try:
-            yf_pair = pair if '=X' in pair else pair + '=X'
-            df = fetch_data(yf_pair, start, end, '1d')
-            if df.empty:
-                print(f"❌ No data for {pair}")
-                results[pair] = {'success': False, 'error': 'No data'}
-                continue
-            df = add_features(df)
-            if df.empty:
-                print(f"❌ Feature engineering failed for {pair}")
-                results[pair] = {'success': False, 'error': 'Feature engineering failed'}
-                continue
-            model, scaler, acc = pair_model_manager.train_model(df, model_type)
-            if model is None:
-                print(f"❌ Training failed for {pair}")
-                results[pair] = {'success': False, 'error': 'Training failed'}
-                continue
-            pair_model_manager.save_model(pair, model_type, model, scaler, {'accuracy': acc})
-            print(f"✅ Saved new {model_type} model for {pair} with accuracy {acc:.2f}")
-            results[pair] = {'success': True, 'accuracy': acc}
-        except Exception as e:
-            print(f"❌ Error retraining {pair}: {e}")
-            results[pair] = {'success': False, 'error': str(e)}
-    print(f"🔄 Auto-retraining completed. Results: {results}")
-    return results
-
-def auto_retrain_loop():
-    global auto_retrain_running
-    # Wait 5 minutes before first run to avoid startup congestion
-    time.sleep(60 * 5)
-    while AUTO_RETRAIN_ENABLED:
-        if auto_retrain_running:
-            retrain_all_pairs()
-            time.sleep(RETRAIN_INTERVAL_DAYS * 24 * 3600)
-        else:
-            auto_retrain_running = True
-            retrain_all_pairs()
-            time.sleep(RETRAIN_INTERVAL_DAYS * 24 * 3600)
-
-def start_auto_retrain_thread():
-    global auto_retrain_thread
-    if not AUTO_RETRAIN_ENABLED:
-        print("ℹ️ Auto-retraining is disabled by environment variable.")
-        return
-    if auto_retrain_thread is None or not auto_retrain_thread.is_alive():
-        auto_retrain_thread = threading.Thread(target=auto_retrain_loop, daemon=True)
-        auto_retrain_thread.start()
-        print(f"🚀 Auto-retraining thread started (interval: {RETRAIN_INTERVAL_DAYS} days, first run in 5 min).")
-
-# ---------- Pre-training data quality check ----------
-def check_data_quality(df, pair):
-    """Return a diagnostic dict for the given DataFrame."""
-    results = {
-        "pair": pair,
-        "missing_values": {},
-        "outliers_count": 0,
-        "max_z_score": 0.0,
-        "class_distribution": {},
-        "hold_percentage": 0.0,
-        "warning": None,
-        "close_range": [float(df['close'].min()), float(df['close'].max())],
-        "rsi_range": [float(df['rsi_14'].min()), float(df['rsi_14'].max())] if 'rsi_14' in df else None,
-        "price_drift": None,
-        "drift_warning": None
-    }
-
-    # 1. Missing values
-    missing = df.isnull().sum()
-    if missing.sum() > 0:
-        results["missing_values"] = missing[missing>0].to_dict()
-
-    # 2. Outliers in returns
-    ret = df['close'].pct_change().dropna()
-    if len(ret) > 1:
-        z_scores = np.abs((ret - ret.mean()) / ret.std())
-        outliers = z_scores > 3
-        results["outliers_count"] = int(outliers.sum())
-        results["max_z_score"] = float(z_scores.max()) if len(z_scores) > 0 else 0.0
-
-    # 3. Class balance
-    future_ret = df['close'].shift(-1) / df['close'] - 1
-    labels = np.where(future_ret > 0.001, 1, np.where(future_ret < -0.001, -1, 0))
-    labels = labels[:-1]  # last row has no future
-    unique, counts = np.unique(labels, return_counts=True)
-    results["class_distribution"] = dict(zip(map(int, unique), map(int, counts)))
-    if len(labels) > 0:
-        hold_pct = counts[0] / len(labels) if 0 in unique else 0.0
-        results["hold_percentage"] = float(hold_pct)
-        if hold_pct > 0.8:
-            results["warning"] = "Over 80% 'HOLD' – model may ignore rare signals."
-
-    # 4. Data drift (split in half)
-    if len(df) > 200:
-        split = len(df) // 2
-        early = df.iloc[:split]
-        late = df.iloc[split:]
-        drift = abs(early['close'].mean() - late['close'].mean()) / early['close'].mean()
-        results["price_drift"] = float(drift)
-        if drift > 0.1:
-            results["drift_warning"] = "Significant price level change – consider retraining more frequently."
-
-    return results
-
-# ---------- Performance monitoring and auto-retraining trigger ----------
-def check_performance_and_retrain():
-    """Query last 50 predictions, compute win rate, trigger retrain if below threshold."""
-    ok, data = supabase_request('GET', 'predictions?actual_outcome=not.is.null&order=created_at.desc&limit=50')
-    if not ok or not data:
-        return {"message": "Not enough data"}
-    wins = sum(1 for r in data if r['actual_outcome'] == 'win')
-    win_rate = wins / len(data) if data else 0.0
-    threshold = 0.45
-    if win_rate < threshold:
-        # Trigger retraining asynchronously
-        threading.Thread(target=retrain_all_pairs).start()
-        return {"message": f"Win rate {win_rate:.2f} below {threshold:.2f}, retraining triggered"}
-    else:
-        return {"message": f"Win rate {win_rate:.2f} OK"}
-
-def performance_monitor_loop():
-    """Background thread to check performance every 24 hours."""
-    while True:
-        time.sleep(86400)  # 24 hours
-        try:
-            with app.app_context():
-                # We'll just call the function directly
-                print("⏰ Running performance check...")
-                result = check_performance_and_retrain()
-                print(f"Performance check result: {result}")
-        except Exception as e:
-            print(f"Performance monitor error: {e}")
 
 # ---------- Flask Routes ----------
 @app.route('/')
@@ -1181,91 +1036,13 @@ def update_trade():
         return jsonify({"success": False, "error": str(e)})
 
 @app.route('/api/retrain', methods=['POST'])
-def retrain_model():
-    data = request.get_json()
-    pair = data.get('pair')
-    model_type = data.get('model_type')
-    if not pair:
-        return jsonify({"success": False, "error": "pair required"})
-    if model_type is None:
-        model_type = PAIR_MODEL_TYPES.get(pair)
-        if model_type is None:
-            return jsonify({"success": False, "error": "No model type configured for this pair"})
-    if model_type == 'rule':
-        return jsonify({"success": False, "error": "Rule-based model cannot be retrained"})
-    end = datetime.now().strftime('%Y-%m-%d')
-    start = (datetime.now() - timedelta(days=RETRAIN_DATA_DAYS)).strftime('%Y-%m-%d')
-    yf_pair = pair if '=X' in pair else pair + '=X'
-    df = fetch_data(yf_pair, start, end, '1d')
-    if df.empty:
-        return jsonify({"success": False, "error": "No data fetched"})
-    df = add_features(df)
-    if df.empty:
-        return jsonify({"success": False, "error": "Feature engineering failed"})
-    model, scaler, acc = pair_model_manager.train_model(df, model_type)
-    if model is None:
-        return jsonify({"success": False, "error": "Training failed"})
-    pair_model_manager.save_model(pair, model_type, model, scaler, {'accuracy': acc})
-    return jsonify({"success": True, "accuracy": acc, "model_type": model_type})
-
-@app.route('/api/retrain_all', methods=['POST'])
-def retrain_all():
+def retrain_endpoint():
+    """Manually trigger model retraining."""
     try:
-        results = retrain_all_pairs()
-        return jsonify({"success": True, "results": results})
+        success = retrain_model()
+        return jsonify({'success': success, 'message': 'Retraining completed' if success else 'Retraining failed'})
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)})
-
-@app.route('/api/retrain_status', methods=['GET'])
-def retrain_status():
-    return jsonify({
-        "enabled": AUTO_RETRAIN_ENABLED,
-        "interval_days": RETRAIN_INTERVAL_DAYS,
-        "running": auto_retrain_running
-    })
-
-@app.route('/api/check_data', methods=['POST'])
-def check_data_route():
-    """Run pre-training data quality checks for a given pair."""
-    data = request.get_json()
-    if not data or 'pair' not in data:
-        return jsonify({"error": "Missing 'pair' parameter"}), 400
-
-    pair = data['pair']
-    days = int(data.get('days', 730))
-
-    end = datetime.now().strftime('%Y-%m-%d')
-    start = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
-
-    try:
-        df = yf.download(pair, start=start, end=end, progress=False, auto_adjust=False)
-        if df.empty:
-            return jsonify({"error": "No data fetched for this pair"}), 400
-
-        # Normalise column names to lower case
-        df.columns = [c.lower() for c in df.columns]
-
-        # Ensure required columns exist
-        required = ['open', 'high', 'low', 'close']
-        if not all(col in df.columns for col in required):
-            return jsonify({"error": "Missing OHLC data"}), 400
-
-        # Compute minimal features for checks
-        df['rsi_14'] = ta.rsi(df['close'], length=14)
-        df['atr_14'] = ta.atr(df['high'], df['low'], df['close'], length=14)
-        df = df.dropna()
-
-        report = check_data_quality(df, pair)
-        return jsonify(report)
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/api/check_performance', methods=['GET'])
-def check_performance_route():
-    """Endpoint to check model performance and trigger retrain if needed."""
-    result = check_performance_and_retrain()
-    return jsonify(result)
+        return jsonify({'success': False, 'message': str(e)}), 500
 
 # ---------- Startup ----------
 if __name__ == '__main__':
@@ -1287,14 +1064,7 @@ if __name__ == '__main__':
         print(f"✅ yfinance works: fetched {len(test_data)} bars for {test_pair}")
     else:
         print(f"❌ yfinance failed for {test_pair}. Check internet connection and package.")
-
-    # Start auto-retraining thread (with a 5-min delay)
+    # Start auto-retrain thread
     start_auto_retrain_thread()
-
-    # Start performance monitor thread
-    monitor_thread = threading.Thread(target=performance_monitor_loop, daemon=True)
-    monitor_thread.start()
-    print("🚀 Performance monitor thread started (checks every 24h).")
-
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)

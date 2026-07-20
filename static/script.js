@@ -7,6 +7,9 @@ document.addEventListener('DOMContentLoaded', () => {
             const autoTradeToggle = document.getElementById('autoTradeToggle');
             const autoTradeStatus = document.getElementById('autoTradeStatus');
 
+            const retrainBtn = document.getElementById('retrainBtn');
+            const retrainStatus = document.getElementById('retrainStatus');
+
             if (autoTradeToggle) {
                 fetch('/api/auto_trade_status')
                     .then(res => res.json())
@@ -36,6 +39,23 @@ document.addEventListener('DOMContentLoaded', () => {
                             autoTradeStatus.textContent = data.enabled ? 'Enabled (60s)' : 'Disabled';
                             autoTradeStatus.style.color = data.enabled ? '#10b981' : 'var(--text-secondary)';
                         });
+                });
+            }
+
+            if (retrainBtn) {
+                retrainBtn.addEventListener('click', async() => {
+                    retrainBtn.disabled = true;
+                    retrainStatus.textContent = 'Retraining...';
+                    try {
+                        const resp = await fetch('/api/retrain', { method: 'POST' });
+                        const data = await resp.json();
+                        retrainStatus.textContent = data.success ? '✅ Done' : '❌ Failed';
+                    } catch (e) {
+                        retrainStatus.textContent = '⚠️ Error';
+                    } finally {
+                        retrainBtn.disabled = false;
+                        setTimeout(() => { retrainStatus.textContent = ''; }, 5000);
+                    }
                 });
             }
 
@@ -100,7 +120,10 @@ document.addEventListener('DOMContentLoaded', () => {
         table.className = 'signal-table';
         table.innerHTML = `
             <thead>
-                <tr><th>Pair</th><th>Signal</th><th>Conf</th><th>Pattern(s)</th><th>Trend</th><th>Price</th><th>TP</th><th>SL</th><th>ATR</th><th>Action</th><th>Trade</th></tr>
+                <tr><th>Pair</th><th>Signal</th><th>Conf</th><th>Pattern(s)</th><th>Trend</th>
+                    <th>Price</th><th>TP</th><th>SL</th><th>ATR</th>
+                    <th>TP Profit $</th><th>SL Loss $</th>
+                    <th>Action</th><th>Trade</th></tr>
             </thead>
             <tbody></tbody>
         `;
@@ -121,14 +144,19 @@ document.addEventListener('DOMContentLoaded', () => {
 
             const patterns = r.pattern_details ? Object.keys(r.pattern_details.candle_patterns || {}).join(', ') : 'None';
             row.insertCell(3).textContent = patterns;
-
             row.insertCell(4).textContent = r.trend || 'neutral';
             row.insertCell(5).textContent = r.price;
             row.insertCell(6).textContent = r.tp;
             row.insertCell(7).textContent = r.sl;
             row.insertCell(8).textContent = r.atr;
 
-            const copyCell = row.insertCell(9);
+            // Profit columns
+            const profitCell = row.insertCell(9);
+            profitCell.textContent = r.tp_profit !== undefined && r.tp_profit !== null ? r.tp_profit.toFixed(2) : '-';
+            const lossCell = row.insertCell(10);
+            lossCell.textContent = r.sl_loss !== undefined && r.sl_loss !== null ? r.sl_loss.toFixed(2) : '-';
+
+            const copyCell = row.insertCell(11);
             const copyBtn = document.createElement('button');
             copyBtn.textContent = '📋 Copy';
             copyBtn.className = 'copy-btn';
@@ -138,7 +166,7 @@ document.addEventListener('DOMContentLoaded', () => {
             });
             copyCell.appendChild(copyBtn);
 
-            const tradeCell = row.insertCell(10);
+            const tradeCell = row.insertCell(12);
             if (r.signal !== 'HOLD') {
                 const tradeBtn = document.createElement('button');
                 tradeBtn.textContent = '🚀 Trade Now';
@@ -198,34 +226,5 @@ document.addEventListener('DOMContentLoaded', () => {
         navigator.clipboard.writeText(text);
     }
 
-    // Retrain button handler
-    document.getElementById('retrainBtn').addEventListener('click', async () => {
-        const btn = document.getElementById('retrainBtn');
-        const status = document.getElementById('retrainStatus');
-        btn.disabled = true;
-        btn.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Retraining...';
-        status.textContent = 'Retraining started...';
-        try {
-            const resp = await fetch('/api/retrain_all', { method: 'POST' });
-            const data = await resp.json();
-            if (data.success) {
-                let msg = 'Retraining completed: ';
-                for (const [pair, res] of Object.entries(data.results)) {
-                    if (res.success) {
-                        msg += `${pair} (acc: ${res.accuracy.toFixed(3)}), `;
-                    } else {
-                        msg += `${pair} (failed: ${res.error}), `;
-                    }
-                }
-                status.textContent = msg.slice(0, -2);
-            } else {
-                status.textContent = 'Error: ' + data.error;
-            }
-        } catch (err) {
-            status.textContent = 'Network error: ' + err.message;
-        } finally {
-            btn.disabled = false;
-            btn.innerHTML = '<i class="fas fa-sync-alt"></i> Retrain All Models';
-        }
-    });
+    window.tradeNow = tradeNow;
 });
