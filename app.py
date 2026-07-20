@@ -413,7 +413,10 @@ CREATE TABLE IF NOT EXISTS trades (
     tp FLOAT,
     sl FLOAT,
     result TEXT,
-    pnl FLOAT
+    pnl FLOAT,
+    source TEXT,
+    ml_conf FLOAT,
+    rule_conf FLOAT
 );
 
 CREATE TABLE IF NOT EXISTS config (
@@ -422,6 +425,9 @@ CREATE TABLE IF NOT EXISTS config (
 );
 
 INSERT INTO config (key, value) VALUES ('min_confidence', 0.6)
+ON CONFLICT (key) DO NOTHING;
+
+INSERT INTO config (key, value) VALUES ('rule_weight', 0.3)
 ON CONFLICT (key) DO NOTHING;
 
 CREATE INDEX IF NOT EXISTS idx_trades_result ON trades(result);
@@ -454,7 +460,16 @@ def get_min_confidence():
 def update_min_confidence(new_val):
     supabase_request('PATCH', 'config?key=eq.min_confidence', {'value': new_val})
 
-def log_trade(pair, signal, price, tp, sl, result, pnl):
+def load_rule_weight():
+    global _rule_weight
+    ok, result = supabase_request('GET', 'config?key=eq.rule_weight')
+    if ok and result:
+        _rule_weight = result[0].get('value', 0.3)
+    else:
+        _rule_weight = 0.3
+    print(f"Loaded rule_weight: {_rule_weight:.2f}")
+
+def log_trade(pair, signal, price, tp, sl, result, pnl, source='hybrid', ml_conf=0.0, rule_conf=0.0):
     data = {
         'pair': pair,
         'signal': signal,
@@ -463,7 +478,10 @@ def log_trade(pair, signal, price, tp, sl, result, pnl):
         'sl': sl,
         'result': result,
         'pnl': pnl,
-        'timestamp': datetime.now().isoformat()
+        'timestamp': datetime.now().isoformat(),
+        'source': source,
+        'ml_conf': ml_conf,
+        'rule_conf': rule_conf
     }
     ok, _ = supabase_request('POST', 'trades', data)
     if not ok:
@@ -489,6 +507,44 @@ def update_confidence_threshold():
         update_min_confidence(new_val)
     except Exception as e:
         print(f"Error updating confidence threshold: {e}")
+
+# ---------- Dynamic Fusion Weight ----------
+_rule_weight = 0.3
+_rule_weight_lock = threading.Lock()
+_RULE_WEIGHT_UPDATE_INTERVAL = 3600  # 1 hour
+
+def update_rule_weight():
+    """Adjust rule_weight based on recent performance of ML vs rule signals."""
+    global _rule_weight
+    try:
+        ok, trades = supabase_request('GET', 'trades?limit=50&order=timestamp.desc')
+        if not ok or len(trades) < 20:
+            return
+        ml_trades = [t for t in trades if t.get('source') == 'ml' and t['result'] != 'pending']
+        rule_trades = [t for t in trades if t.get('source') == 'rule' and t['result'] != 'pending']
+        if len(ml_trades) < 10 or len(rule_trades) < 10:
+            return
+        ml_wr = sum(1 for t in ml_trades if t['result'] == 'win') / len(ml_trades)
+        rule_wr = sum(1 for t in rule_trades if t['result'] == 'win') / len(rule_trades)
+        with _rule_weight_lock:
+            if rule_wr > ml_wr:
+                _rule_weight = min(1.0, _rule_weight + 0.05)
+            elif ml_wr > rule_wr:
+                _rule_weight = max(0.0, _rule_weight - 0.05)
+            supabase_request('PATCH', 'config?key=eq.rule_weight', {'value': _rule_weight})
+        print(f"Updated rule_weight: {_rule_weight:.2f} (ML WR: {ml_wr:.2f}, Rule WR: {rule_wr:.2f})")
+    except Exception as e:
+        print(f"Error updating rule_weight: {e}")
+
+def rule_weight_update_loop():
+    while True:
+        time.sleep(_RULE_WEIGHT_UPDATE_INTERVAL)
+        update_rule_weight()
+
+def start_rule_weight_thread():
+    thread = threading.Thread(target=rule_weight_update_loop, daemon=True)
+    thread.start()
+    print("🚀 Rule‑weight update thread started.")
 
 # ---------- Pattern Recognition ----------
 def get_date_ranges():
@@ -650,10 +706,9 @@ _retraining_thread = None
 _auto_retrain_enabled = True
 _RETRAIN_INTERVAL_HOURS = 6
 _RETRAIN_PAIRS = ['EURUSD=X', 'GBPUSD=X', 'AUDUSD=X', 'USDCAD=X']
-_TRAINING_BARS = 2000
 
 def retrain_model():
-    """Fetch fresh data and retrain the SVM+HMM model."""
+    """Fetch fresh data and retrain the ensemble model."""
     with _retraining_lock:
         print("🔄 Starting model retraining...")
         try:
@@ -663,16 +718,14 @@ def retrain_model():
                 start = end - timedelta(days=90)  # enough for ~2000 hourly bars
                 df = fetch_data(pair, start.strftime('%Y-%m-%d'), end.strftime('%Y-%m-%d'), '1h')
                 if not df.empty:
-                    # Keep the timestamp as a column and reset index to get a clean integer index
-                    df = df.reset_index()  # 'index' column becomes timestamp
+                    # Keep timestamp as column, reset index
+                    df = df.reset_index()
                     all_dfs.append(df)
             if not all_dfs:
                 print("❌ No data for retraining.")
                 return False
 
-            # Concatenate all DataFrames with a unique integer index
             combined = pd.concat(all_dfs, ignore_index=True)
-            # The timestamp is in the 'index' column; we don't need it for training
             combined = combined.drop(columns=['index']) if 'index' in combined.columns else combined
 
             success = pattern_model.train(combined)
@@ -699,73 +752,76 @@ def start_auto_retrain_thread():
         _retraining_thread.start()
         print("🚀 Auto‑retrain thread started.")
 
-# ---------- Main Signal Processing ----------
+# ---------- Signal Computation (ML + Rule) ----------
 def compute_pattern_signal(df):
-    ml_signal, ml_confidence = pattern_model.predict_pattern(df)
-    if ml_confidence > 0.55 and ml_signal != 'HOLD':
-        signal = ml_signal
-        confidence = ml_confidence
+    """
+    Returns (ml_signal, ml_conf, rule_signal, rule_conf, details)
+    """
+    # ML prediction
+    ml_signal, ml_conf = pattern_model.predict_pattern(df)
+
+    # ---- Rule-based (candlestick + chart patterns) ----
+    candle_patterns = detect_candlestick_patterns(df)
+    candle_signal, candle_conf = get_pattern_signal(candle_patterns)
+    chart_patterns = detect_chart_patterns(df, lookback=40) if len(df) >= 40 else []
+    support, resistance = detect_support_resistance(df)
+    trend = detect_trend(df)
+    breakout = detect_breakout(df)
+
+    rule_signal = 'HOLD'
+    rule_conf = 0.0
+
+    if candle_signal != 'HOLD':
+        rule_signal = candle_signal
+        rule_conf = candle_conf
+        for pat in chart_patterns:
+            if pat in ['double_bottom', 'inverse_head_shoulders', 'ascending_triangle'] and rule_signal == 'BUY':
+                rule_conf = min(1.0, rule_conf + 0.15)
+            elif pat in ['double_top', 'head_shoulders', 'descending_triangle'] and rule_signal == 'SELL':
+                rule_conf = min(1.0, rule_conf + 0.15)
+        if rule_signal == 'BUY' and trend == 'uptrend':
+            rule_conf = min(1.0, rule_conf + 0.1)
+        elif rule_signal == 'SELL' and trend == 'downtrend':
+            rule_conf = min(1.0, rule_conf + 0.1)
     else:
-        candle_patterns = detect_candlestick_patterns(df)
-        candle_signal, candle_conf = get_pattern_signal(candle_patterns)
-        chart_patterns = detect_chart_patterns(df, lookback=40) if len(df) >= 40 else []
-        support, resistance = detect_support_resistance(df)
-        trend = detect_trend(df)
-        breakout = detect_breakout(df)
-        if candle_signal != 'HOLD':
-            signal = candle_signal
-            confidence = candle_conf
-            for pat in chart_patterns:
-                if pat in ['double_bottom', 'inverse_head_shoulders', 'ascending_triangle'] and signal == 'BUY':
-                    confidence = min(1.0, confidence + 0.15)
-                elif pat in ['double_top', 'head_shoulders', 'descending_triangle'] and signal == 'SELL':
-                    confidence = min(1.0, confidence + 0.15)
-            if signal == 'BUY' and trend == 'uptrend':
-                confidence = min(1.0, confidence + 0.1)
-            elif signal == 'SELL' and trend == 'downtrend':
-                confidence = min(1.0, confidence + 0.1)
-        else:
-            if chart_patterns:
-                bullish_pats = ['double_bottom', 'inverse_head_shoulders', 'ascending_triangle', 'falling_wedge']
-                bearish_pats = ['double_top', 'head_shoulders', 'descending_triangle', 'rising_wedge']
-                bullish = sum(1 for p in chart_patterns if p in bullish_pats)
-                bearish = sum(1 for p in chart_patterns if p in bearish_pats)
-                if bullish > bearish:
-                    signal = 'BUY'
-                    confidence = 0.5 + 0.3 * (bullish / (bullish + bearish + 1e-6))
-                elif bearish > bullish:
-                    signal = 'SELL'
-                    confidence = 0.5 + 0.3 * (bearish / (bullish + bearish + 1e-6))
-                else:
-                    signal = 'HOLD'
-                    confidence = 0.0
-                if signal == 'BUY' and trend == 'uptrend':
-                    confidence = min(1.0, confidence + 0.2)
-                elif signal == 'SELL' and trend == 'downtrend':
-                    confidence = min(1.0, confidence + 0.2)
+        if chart_patterns:
+            bullish_pats = ['double_bottom', 'inverse_head_shoulders', 'ascending_triangle', 'falling_wedge']
+            bearish_pats = ['double_top', 'head_shoulders', 'descending_triangle', 'rising_wedge']
+            bullish = sum(1 for p in chart_patterns if p in bullish_pats)
+            bearish = sum(1 for p in chart_patterns if p in bearish_pats)
+            if bullish > bearish:
+                rule_signal = 'BUY'
+                rule_conf = 0.5 + 0.3 * (bullish / (bullish + bearish + 1e-6))
+            elif bearish > bullish:
+                rule_signal = 'SELL'
+                rule_conf = 0.5 + 0.3 * (bearish / (bullish + bearish + 1e-6))
             else:
-                signal = 'HOLD'
-                confidence = 0.0
-    trend = detect_trend(df, ma_short=20, ma_long=200)
-    if signal != 'HOLD':
-        if signal == 'BUY' and trend == 'downtrend':
-            signal = 'HOLD'
-            confidence = 0.0
-        elif signal == 'SELL' and trend == 'uptrend':
-            signal = 'HOLD'
-            confidence = 0.0
-    min_conf = get_min_confidence()
-    if confidence >= min_conf and signal != 'HOLD':
-        final_signal = signal
-    else:
-        final_signal = 'HOLD'
+                rule_signal = 'HOLD'
+                rule_conf = 0.0
+            if rule_signal == 'BUY' and trend == 'uptrend':
+                rule_conf = min(1.0, rule_conf + 0.2)
+            elif rule_signal == 'SELL' and trend == 'downtrend':
+                rule_conf = min(1.0, rule_conf + 0.2)
+        else:
+            rule_signal = 'HOLD'
+            rule_conf = 0.0
+
+    # Trend filter for both
+    if rule_signal != 'HOLD':
+        if rule_signal == 'BUY' and trend == 'downtrend':
+            rule_signal = 'HOLD'
+            rule_conf = 0.0
+        elif rule_signal == 'SELL' and trend == 'uptrend':
+            rule_signal = 'HOLD'
+            rule_conf = 0.0
+
     details = {
         'trend': trend,
-        'support': support if 'support' in locals() else None,
-        'resistance': resistance if 'resistance' in locals() else None,
-        'breakout': breakout if 'breakout' in locals() else None
+        'support': support,
+        'resistance': resistance,
+        'breakout': breakout
     }
-    return final_signal, confidence, details
+    return ml_signal, ml_conf, rule_signal, rule_conf, details
 
 def compute_tp_sl(price, atr, signal, risk_atr=RISK_ATR, reward_ratio=REWARD_RATIO):
     risk = atr * risk_atr
@@ -785,33 +841,57 @@ def process_pair(pair, interval, atr_period, risk_mult, reward_ratio):
         if df.empty or len(df) < 60:
             return None
         df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=atr_period)
-        df['volatility'] = df['close'].pct_change().rolling(20).std()
         df = df.dropna()
         if df.empty:
             return None
-        signal, confidence, details = compute_pattern_signal(df)
+
+        # Get ML + rule signals
+        ml_signal, ml_conf, rule_signal, rule_conf, details = compute_pattern_signal(df)
+
+        # Fuse using dynamic weight
+        with _rule_weight_lock:
+            rw = _rule_weight
+        final_signal, final_conf = pattern_model.fuse_signals(ml_signal, ml_conf, rule_signal, rule_conf, rw)
+
+        # Determine source for logging
+        if final_signal == 'HOLD':
+            source = 'hold'
+        elif final_signal == ml_signal and final_signal != 'HOLD':
+            source = 'ml'
+        elif final_signal == rule_signal and final_signal != 'HOLD':
+            source = 'rule'
+        else:
+            source = 'hybrid'
+
         current_atr = df['atr'].iloc[-1]
-        live_price, live_ok = get_live_entry_price(pair, signal)
+        live_price, live_ok = get_live_entry_price(pair, final_signal)
         if live_ok:
             reference_price = live_price
         else:
             reference_price = df['close'].iloc[-1]
-        raw_sl, raw_tp = compute_tp_sl(reference_price, current_atr, signal,
-                                       risk_atr=risk_mult, reward_ratio=reward_ratio)
-        adjusted_sl, adjusted_tp = adjust_sl_tp(pair, reference_price, raw_sl, raw_tp)
-        if adjusted_sl is None or adjusted_tp is None:
-            can_trade = False
-            reason = "Cannot adjust SL/TP to valid levels"
-            sl, tp = raw_sl, raw_tp
-        else:
-            sl, tp = adjusted_sl, adjusted_tp
-            can_trade, reason = validate_sl_tp(pair, reference_price, sl, tp)
 
-        # ----- Profit calculation -----
+        # Compute TP/SL only if signal is not HOLD
+        if final_signal != 'HOLD':
+            raw_sl, raw_tp = compute_tp_sl(reference_price, current_atr, final_signal,
+                                           risk_atr=risk_mult, reward_ratio=reward_ratio)
+            adjusted_sl, adjusted_tp = adjust_sl_tp(pair, reference_price, raw_sl, raw_tp)
+            if adjusted_sl is None or adjusted_tp is None:
+                can_trade = False
+                reason = "Cannot adjust SL/TP to valid levels"
+                sl, tp = raw_sl, raw_tp
+            else:
+                sl, tp = adjusted_sl, adjusted_tp
+                can_trade, reason = validate_sl_tp(pair, reference_price, sl, tp)
+        else:
+            can_trade = False
+            reason = "No signal"
+            sl, tp = None, None
+
+        # Profit calculation
         volume_for_profit = TRADE_VOLUME
         tp_profit = None
         sl_loss = None
-        if signal != 'HOLD' and can_trade:
+        if final_signal != 'HOLD' and can_trade and sl is not None and tp is not None:
             tp_profit = compute_profit(reference_price, tp, pair, volume_for_profit)
             sl_loss = compute_profit(reference_price, sl, pair, volume_for_profit)
 
@@ -821,16 +901,17 @@ def process_pair(pair, interval, atr_period, risk_mult, reward_ratio):
             "signal_point": {
                 "date": str(df.index[-1]),
                 "price": reference_price,
-                "signal": signal
-            } if signal != "HOLD" else None
+                "signal": final_signal
+            } if final_signal != "HOLD" else None
         }
+
         return {
             "pair": pair.replace("=X", ""),
-            "signal": signal,
-            "confidence": round(confidence, 3),
+            "signal": final_signal,
+            "confidence": round(final_conf, 3) if final_signal != 'HOLD' else 0.0,
             "price": round(reference_price, 5),
-            "tp": round(tp, 5),
-            "sl": round(sl, 5),
+            "tp": round(tp, 5) if tp is not None else None,
+            "sl": round(sl, 5) if sl is not None else None,
             "atr": round(current_atr, 5),
             "can_trade": can_trade,
             "can_trade_reason": reason,
@@ -839,6 +920,9 @@ def process_pair(pair, interval, atr_period, risk_mult, reward_ratio):
             "chart": chart_data,
             "tp_profit": round(tp_profit, 2) if tp_profit is not None else None,
             "sl_loss": round(sl_loss, 2) if sl_loss is not None else None,
+            "source": source,
+            "ml_conf": round(ml_conf, 3),
+            "rule_conf": round(rule_conf, 3),
             "error": None
         }
     except Exception as e:
@@ -846,6 +930,7 @@ def process_pair(pair, interval, atr_period, risk_mult, reward_ratio):
         traceback.print_exc()
         return {"pair": pair, "error": str(e)[:100]}
 
+# ---------- Trade Execution ----------
 def execute_trade(pair, signal, price, tp, sl, volume=TRADE_VOLUME):
     global pytrader, pytrader_connected
     if not PYTRADER_AVAILABLE:
@@ -916,8 +1001,13 @@ def auto_trade_iteration():
                 volume=volume
             )
             if trade_res.get('success'):
-                log_trade(res['pair'], res['signal'], res['price'],
-                          res['tp'], res['sl'], 'pending', 0.0)
+                log_trade(
+                    res['pair'], res['signal'], res['price'],
+                    res['tp'], res['sl'], 'pending', 0.0,
+                    source=res.get('source', 'hybrid'),
+                    ml_conf=res.get('ml_conf', 0.0),
+                    rule_conf=res.get('rule_conf', 0.0)
+                )
                 print(f"[Auto-Trade] ✅ {res['signal']} {res['pair']} executed")
             else:
                 print(f"[Auto-Trade] ❌ {res['pair']} failed: {trade_res.get('error')}")
@@ -985,8 +1075,13 @@ def auto_trade():
                 )
                 res['trade'] = trade_res
                 if trade_res['success']:
-                    log_trade(res['pair'], res['signal'], res['price'],
-                              res['tp'], res['sl'], 'pending', 0.0)
+                    log_trade(
+                        res['pair'], res['signal'], res['price'],
+                        res['tp'], res['sl'], 'pending', 0.0,
+                        source=res.get('source', 'hybrid'),
+                        ml_conf=res.get('ml_conf', 0.0),
+                        rule_conf=res.get('rule_conf', 0.0)
+                    )
             else:
                 res['trade'] = {"success": False, "error": "No valid signal or invalid SL/TP"}
             results.append(res)
@@ -1064,7 +1159,10 @@ if __name__ == '__main__':
         print(f"✅ yfinance works: fetched {len(test_data)} bars for {test_pair}")
     else:
         print(f"❌ yfinance failed for {test_pair}. Check internet connection and package.")
-    # Start auto-retrain thread
+    # Load rule_weight from DB
+    load_rule_weight()
+    # Start background threads
     start_auto_retrain_thread()
+    start_rule_weight_thread()
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)

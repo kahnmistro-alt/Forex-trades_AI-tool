@@ -10,3 +10,5 @@ xgboost
 hmmlearn
 scipy
 gunicorn
+xgboost
+imbalanced-learn
