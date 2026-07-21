@@ -10,6 +10,7 @@ from sklearn.svm import SVC
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 from hmmlearn import hmm
+import pandas_datareader.data as web
 
 from candlestick_patterns import detect_candlestick_patterns, get_pattern_signal
 from chart_patterns import detect_chart_patterns
@@ -36,6 +37,7 @@ INITIAL_TRAIN_BARS = 600
 TEST_BARS = 300
 STEP = 300
 
+# ---- Full feature set (technical + commodity + macro) ----
 FEATURES = [
     'open', 'high', 'low', 'close',
     'open_prev_1', 'high_prev_1', 'low_prev_1', 'close_prev_1',
@@ -45,8 +47,140 @@ FEATURES = [
     'roc_10', 'roc_20',
     'returns_std_10', 'returns_skew_10', 'returns_kurt_10',
     'stoch_k', 'stoch_d', 'williams_r', 'cci_20', 'adx_14',
-    'volatility_20', 'volatility_ratio'
+    'volatility_20', 'volatility_ratio',
+    'crude_oil', 'gold', 'agri',
+    'spread_us_de', 'spread_us_uk', 'spread_us_au', 'spread_us_ca',
+    'spread_us_ch', 'spread_de_uk', 'spread_de_jp', 'spread_us_nz',
+    'spread_uk_jp', 'spread_us_jp',
+    'vix'
 ]
+
+# ---------- Caches ----------
+_commodity_cache = {}
+_macro_cache = {}
+
+# ---------- Commodity Data Fetch ----------
+def fetch_commodity_data(start_date, end_date):
+    """Fetch commodity prices with fallback."""
+    global _commodity_cache
+    cache_key = f"{start_date}_{end_date}"
+    if cache_key in _commodity_cache:
+        print("ℹ️ Using cached commodity data.")
+        return _commodity_cache[cache_key]
+    try:
+        print("📊 Fetching commodity data...")
+        symbols = {'crude_oil': 'CL=F', 'gold': 'GC=F', 'agri': 'DBA'}
+        combined = pd.DataFrame()
+        for name, symbol in symbols.items():
+            try:
+                data = yf.download(symbol, start=start_date, end=end_date, progress=False, timeout=60)
+                if not data.empty:
+                    price_series = data['Adj Close'] if 'Adj Close' in data.columns else data['Close']
+                    if isinstance(price_series, pd.DataFrame):
+                        price_series = price_series.iloc[:, 0]
+                    price_series.name = name
+                    if combined.empty:
+                        combined = price_series.to_frame()
+                    else:
+                        combined = combined.join(price_series, how='outer')
+            except Exception as e:
+                print(f"⚠️ Could not fetch {name} ({symbol}): {e}")
+                combined[name] = np.nan
+        if combined.empty:
+            print("⚠️ No commodity data fetched.")
+            return pd.DataFrame()
+        combined = combined.ffill()
+        combined = combined.dropna(how='all')
+        _commodity_cache[cache_key] = combined
+        print(f"✅ Commodity data fetched: {len(combined)} rows")
+        return combined
+    except Exception as e:
+        print(f"❌ Error fetching commodity data: {e}")
+        import traceback
+        traceback.print_exc()
+        return pd.DataFrame()
+
+# ---------- Macro Data Fetch ----------
+def fetch_macro_data(start_date, end_date):
+    """Fetch bond yields and VIX from FRED and Yahoo, compute spreads."""
+    global _macro_cache
+    cache_key = f"{start_date}_{end_date}"
+    if cache_key in _macro_cache:
+        print("ℹ️ Using cached macro data.")
+        return _macro_cache[cache_key]
+    try:
+        print("📊 Fetching macro data (yields & VIX)...")
+        fred_symbols = {
+            'us10y': 'DGS10',
+            'de10y': 'IRLTLT01DEM156N',
+            'uk10y': 'IRLTLT01GBM156N',
+            'au10y': 'IRLTLT01AUM156N',
+            'ca10y': 'IRLTLT01CAM156N',
+            'ch10y': 'IRLTLT01CHM156N',
+            'nz10y': 'IRLTLT01NZM156N',
+            'jp10y': 'IRLTLT01JPM156N',
+        }
+        combined = pd.DataFrame()
+        for name, fred_code in fred_symbols.items():
+            try:
+                data = web.DataReader(fred_code, 'fred', start_date, end_date)
+                data = data.rename(columns={fred_code: name})
+                if combined.empty:
+                    combined = data
+                else:
+                    combined = combined.join(data, how='outer')
+            except Exception as e:
+                print(f"⚠️ Could not fetch {name} ({fred_code}): {e}")
+                combined[name] = np.nan
+
+        vix_data = yf.download('^VIX', start=start_date, end=end_date, progress=False, timeout=60)
+        if not vix_data.empty:
+            vix_series = vix_data['Adj Close'] if 'Adj Close' in vix_data.columns else vix_data['Close']
+            if isinstance(vix_series, pd.DataFrame):
+                # yfinance can return MultiIndex columns even for a single ticker,
+                # which turns this selection into a 1-column DataFrame instead of
+                # a Series — silently breaking the later 'vix' rename/join and
+                # leaving the column entirely NaN.
+                vix_series = vix_series.iloc[:, 0]
+            vix_series.name = 'vix'
+            if combined.empty:
+                combined = vix_series.to_frame()
+            else:
+                combined = combined.join(vix_series, how='outer')
+
+        if combined.empty:
+            print("⚠️ No macro data fetched.")
+            return pd.DataFrame()
+
+        required_cols = ['us10y', 'de10y', 'uk10y', 'au10y', 'ca10y', 'ch10y', 'nz10y', 'jp10y', 'vix']
+        for col in required_cols:
+            if col not in combined.columns:
+                combined[col] = np.nan
+
+        combined = combined.ffill().bfill()
+
+        combined['spread_us_de'] = combined['us10y'] - combined['de10y']
+        combined['spread_us_uk'] = combined['us10y'] - combined['uk10y']
+        combined['spread_us_au'] = combined['us10y'] - combined['au10y']
+        combined['spread_us_ca'] = combined['us10y'] - combined['ca10y']
+        combined['spread_us_ch'] = combined['us10y'] - combined['ch10y']
+        combined['spread_de_uk'] = combined['de10y'] - combined['uk10y']
+        combined['spread_de_jp'] = combined['de10y'] - combined['jp10y']
+        combined['spread_us_nz'] = combined['us10y'] - combined['nz10y']
+        combined['spread_uk_jp'] = combined['uk10y'] - combined['jp10y']
+        combined['spread_us_jp'] = combined['us10y'] - combined['jp10y']
+
+        spread_cols = [col for col in combined.columns if col.startswith('spread_')]
+        combined = combined.dropna(subset=spread_cols, how='all')
+
+        _macro_cache[cache_key] = combined
+        print(f"✅ Macro data fetched: {len(combined)} rows")
+        return combined
+    except Exception as e:
+        print(f"❌ Error fetching macro data: {e}")
+        import traceback
+        traceback.print_exc()
+        return pd.DataFrame()
 
 # ---------- Data Fetch & Feature Engineering ----------
 def fetch_data(pair, start, end, interval):
@@ -107,7 +241,6 @@ def add_features(df):
     df['returns_skew_10'] = ret.rolling(10).skew()
     df['returns_kurt_10'] = ret.rolling(10).kurt()
 
-    # New momentum
     stoch = ta.stoch(df['high'], df['low'], df['close'], k=14, d=3)
     if stoch is not None and not stoch.empty:
         df['stoch_k'] = stoch.get('STOCHk_14_3_3', np.nan)
@@ -118,12 +251,8 @@ def add_features(df):
     df['williams_r'] = ta.willr(df['high'], df['low'], df['close'], length=14)
     df['cci_20'] = ta.cci(df['high'], df['low'], df['close'], length=20)
     adx = ta.adx(df['high'], df['low'], df['close'], length=14)
-    if adx is not None and not adx.empty:
-        df['adx_14'] = adx.get('ADX_14', np.nan)
-    else:
-        df['adx_14'] = np.nan
+    df['adx_14'] = adx['ADX_14'] if adx is not None else np.nan
 
-    # New volatility
     df['volatility_20'] = ret.rolling(20).std()
     df['volatility_ratio'] = df['volatility_20'] / df['volatility_20'].rolling(10).mean()
     df['volatility_ratio'] = df['volatility_ratio'].replace([np.inf, -np.inf], np.nan)
@@ -133,14 +262,21 @@ def add_features(df):
         df[f'high_prev_{lag}'] = df['high'].shift(lag)
         df[f'low_prev_{lag}'] = df['low'].shift(lag)
         df[f'close_prev_{lag}'] = df['close'].shift(lag)
-    
+
+    # Ensure commodity and macro columns exist (already merged)
+    for col in FEATURES:
+        if col not in df.columns:
+            df[col] = np.nan
+        else:
+            df[col] = df[col].ffill()
+
     df = df.replace([np.inf, -np.inf], np.nan)
-    df = df.dropna(subset=FEATURES)
     print(f"After feature engineering: {df.shape[0]} rows")
     return df
 
 def prepare_ml_data(df):
-    X = df[FEATURES].values
+    cols = [f for f in FEATURES if f in df.columns]
+    X = df[cols].values
     future_ret = df['close'].shift(-1) / df['close'] - 1
     y = np.where(future_ret > 0.001, 1, np.where(future_ret < -0.001, -1, 0))
     X = X[:-1]
@@ -171,7 +307,8 @@ def train_svm_hmm(X, y):
 
 def predict_svm_hmm(df, svm, hmm_model, scaler):
     try:
-        X = df[FEATURES].values[-1:].reshape(1, -1)
+        cols = [f for f in FEATURES if f in df.columns]
+        X = df[cols].values[-1:].reshape(1, -1)
         X_scaled = scaler.transform(X)
         prob = svm.predict_proba(X_scaled)[0]
         pred = svm.predict(X_scaled)[0]
@@ -197,7 +334,7 @@ def predict_svm_hmm(df, svm, hmm_model, scaler):
     except:
         return 'HOLD', 0.0
 
-# ---------- Rule-based (pure patterns) ----------
+# ---------- Rule-based ----------
 def detect_trend(df, ma_long=200):
     if len(df) < ma_long:
         return 'neutral'
@@ -314,12 +451,77 @@ def run_walk_forward(pair, start, end, interval,
                      risk_atr, reward_ratio, base_conf,
                      model_type='rule',
                      use_trend_filter=True, use_dynamic_conf=True):
+    # Fetch pair data
     df = fetch_data(pair, start, end, interval)
     if df.empty:
         return None
+
+    # ---- Merge macro & commodity ----
+    macro_df = fetch_macro_data(start, end)
+    commodity_df = fetch_commodity_data(start, end)
+
+    if not macro_df.empty:
+        df = df.reset_index()
+        df['Date'] = pd.to_datetime(df['Date'])
+        macro_df.index = pd.to_datetime(macro_df.index)
+        df = df.merge(macro_df, left_on='Date', right_index=True, how='left')
+        for col in macro_df.columns:
+            if col in df.columns:
+                df[col] = df[col].ffill()
+        df = df.set_index('Date')
+    else:
+        for col in macro_df.columns if not macro_df.empty else []:
+            df[col] = np.nan
+
+    if not commodity_df.empty:
+        df = df.reset_index()
+        df['Date'] = pd.to_datetime(df['Date'])
+        commodity_df.index = pd.to_datetime(commodity_df.index)
+        df = df.merge(commodity_df, left_on='Date', right_index=True, how='left')
+        for col in ['crude_oil', 'gold', 'agri']:
+            if col in df.columns:
+                df[col] = df[col].ffill()
+        df = df.set_index('Date')
+    else:
+        for col in ['crude_oil', 'gold', 'agri']:
+            df[col] = np.nan
+
+    # ---- Feature engineering ----
     df = add_features(df)
     if df.empty or len(df) < initial_train + test_bars:
         print(f"Not enough data: {len(df)} bars, need {initial_train + test_bars}")
+        return None
+
+    # Diagnostic: show how much of each feature column is NaN *before* dropping,
+    # so a single bad column (failed macro fetch, mismatched pandas_ta column
+    # names, etc.) is visible instead of silently wiping the whole dataframe.
+    nan_frac = df[FEATURES].isna().mean().sort_values(ascending=False)
+    worst = nan_frac[nan_frac > 0.5]
+    if not worst.empty:
+        print("⚠️ Columns with >50% NaN before dropna (likely cause of data loss):")
+        for col, frac in worst.items():
+            print(f"    {col}: {frac*100:.1f}% NaN")
+
+    # Drop columns that are entirely (or almost entirely) NaN instead of letting
+    # them drag every row out via dropna(how='any') — a single failed macro/
+    # commodity fetch shouldn't zero out the whole backtest.
+    all_nan_cols = [c for c in FEATURES if df[c].isna().mean() > 0.95]
+    active_features = [c for c in FEATURES if c not in all_nan_cols]
+    if all_nan_cols:
+        print(f"⚠️ Dropping unusable (mostly-NaN) features from this run: {all_nan_cols}")
+        # Actually remove them from the dataframe — leaving them in as all-NaN
+        # columns would still poison prepare_ml_data()/predict_svm_hmm(), which
+        # select df[FEATURES].
+        df = df.drop(columns=all_nan_cols)
+
+    # Drop rows where any *usable* feature is NaN
+    before = len(df)
+    df = df.dropna(subset=active_features, how='any')
+    print(f"After dropna: {len(df)} rows (dropped {before - len(df)})")
+
+    if df.empty or len(df) < initial_train + test_bars:
+        print(f"❌ Not enough usable data for {pair} after dropping NaNs: "
+              f"{len(df)} rows, need {initial_train + test_bars}. Skipping this pair.")
         return None
 
     results = []
@@ -348,12 +550,10 @@ def run_walk_forward(pair, start, end, interval,
                 iteration += 1
                 continue
             signal_func = compute_hybrid_signal_svmhmm
-            ml_model = (svm, hmm_model, scaler)
             acc_val = acc
-        else:  # rule only
+        else:
             svm = None; hmm_model = None; scaler = None; acc_val = 0.0
             signal_func = None
-            ml_model = None
 
         trades = []
         in_position = False
@@ -486,6 +686,10 @@ def run_walk_forward(pair, start, end, interval,
         test_end += step
         iteration += 1
 
+    if not results:
+        print(f"❌ No walk-forward iterations ran for {pair} (dataframe too short after cleaning).")
+        return None
+
     df_summary = pd.DataFrame(results)
     print("\n=== Walk‑Forward Summary ===")
     print(df_summary[['iteration', 'trades', 'win_rate', 'total_pnl']].to_string(index=False))
@@ -520,13 +724,12 @@ def run_multi_pairs(pairs, start, end, interval,
     return all_results
 
 if __name__ == '__main__':
-    print("==== COMPARING RULE-ONLY vs SVM+HMM (all 10 pairs) ====")
+    print("==== COMPARING RULE-ONLY vs SVM+HMM (all 10 pairs, with macro & commodity features) ====")
     print(f"Using {INTERVAL} data from {START_DATE} to {END_DATE}")
     print(f"Train: {INITIAL_TRAIN_BARS} bars, Test: {TEST_BARS} bars, Step: {STEP}")
     print(f"Parameters: risk_atr=1.0, min_confidence={MIN_CONFIDENCE}, reward_ratio=3.0")
     print("Trend filter and dynamic confidence ENABLED\n")
 
-    # Run rule-only
     rule_results = run_multi_pairs(
         pairs=PAIRS,
         start=START_DATE,
@@ -541,7 +744,6 @@ if __name__ == '__main__':
         model_type='rule'
     )
 
-    # Run SVM+HMM
     svm_results = run_multi_pairs(
         pairs=PAIRS,
         start=START_DATE,
@@ -556,7 +758,6 @@ if __name__ == '__main__':
         model_type='svm_hmm'
     )
 
-    # Final comparison table
     print("\n\n========== FINAL COMPARISON ==========")
     comp_data = []
     for pair in PAIRS:

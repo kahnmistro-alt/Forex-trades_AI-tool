@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 from candlestick_patterns import detect_candlestick_patterns, get_pattern_signal
 from chart_patterns import detect_chart_patterns
 from pattern_model import PatternModel
+import pandas_datareader.data as web
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -548,12 +549,105 @@ def start_rule_weight_thread():
     thread.start()
     print("🚀 Rule‑weight update thread started.")
 
+# ---------- Macro Data Cache ----------
+_macro_cache = {}
+_macro_lock = threading.Lock()
+
+def fetch_macro_data(start_date, end_date):
+    """Fetch bond yields and VIX from FRED and Yahoo, compute spreads."""
+    global _macro_cache
+    with _macro_lock:
+        cache_key = f"{start_date}_{end_date}"
+        if cache_key in _macro_cache:
+            print("ℹ️ Using cached macro data.")
+            return _macro_cache[cache_key]
+        try:
+            print("📊 Fetching macro data (yields & VIX)...")
+            # FRED series codes for 10-year yields
+            fred_symbols = {
+                'us10y': 'DGS10',
+                'de10y': 'IRLTLT01DEM156N',  # Germany
+                'uk10y': 'IRLTLT01GBM156N',  # UK
+                'au10y': 'IRLTLT01AUM156N',  # Australia
+                'ca10y': 'IRLTLT01CAM156N',  # Canada
+                'ch10y': 'IRLTLT01CHM156N',  # Switzerland
+                'nz10y': 'IRLTLT01NZM156N',  # New Zealand
+                'jp10y': 'IRLTLT01JPM156N',  # Japan
+            }
+            combined = pd.DataFrame()
+            for name, fred_code in fred_symbols.items():
+                try:
+                    data = web.DataReader(fred_code, 'fred', start_date, end_date)
+                    data = data.rename(columns={fred_code: name})
+                    if combined.empty:
+                        combined = data
+                    else:
+                        combined = combined.join(data, how='outer')
+                except Exception as e:
+                    print(f"⚠️ Could not fetch {name} ({fred_code}): {e}")
+                    # Add NaN column
+                    combined[name] = np.nan
+
+            # Fetch VIX from Yahoo
+            vix_data = yf.download('^VIX', start=start_date, end=end_date, progress=False, timeout=60)
+            if not vix_data.empty:
+                vix_series = vix_data['Adj Close'] if 'Adj Close' in vix_data.columns else vix_data['Close']
+                if isinstance(vix_series, pd.DataFrame):
+                    # yfinance can return MultiIndex columns even for a single
+                    # ticker, turning this selection into a 1-column DataFrame
+                    # instead of a Series — silently breaking the 'vix' name
+                    # assignment/join below and leaving the column all-NaN.
+                    vix_series = vix_series.iloc[:, 0]
+                vix_series.name = 'vix'
+                if combined.empty:
+                    combined = vix_series.to_frame()
+                else:
+                    combined = combined.join(vix_series, how='outer')
+
+            if combined.empty:
+                print("⚠️ No macro data fetched.")
+                return pd.DataFrame()
+
+            # Ensure all required columns exist
+            required_cols = ['us10y', 'de10y', 'uk10y', 'au10y', 'ca10y', 'ch10y', 'nz10y', 'jp10y', 'vix']
+            for col in required_cols:
+                if col not in combined.columns:
+                    combined[col] = np.nan
+
+            # Forward fill (daily yields are often missing on weekends)
+            combined = combined.ffill().bfill()
+
+            # Compute spreads (all spreads use the latest available yields)
+            combined['spread_us_de'] = combined['us10y'] - combined['de10y']
+            combined['spread_us_uk'] = combined['us10y'] - combined['uk10y']
+            combined['spread_us_au'] = combined['us10y'] - combined['au10y']
+            combined['spread_us_ca'] = combined['us10y'] - combined['ca10y']
+            combined['spread_us_ch'] = combined['us10y'] - combined['ch10y']
+            combined['spread_de_uk'] = combined['de10y'] - combined['uk10y']
+            combined['spread_de_jp'] = combined['de10y'] - combined['jp10y']
+            combined['spread_us_nz'] = combined['us10y'] - combined['nz10y']
+            combined['spread_uk_jp'] = combined['uk10y'] - combined['jp10y']
+            combined['spread_us_jp'] = combined['us10y'] - combined['jp10y']
+
+            # Drop rows where all spreads are NaN
+            spread_cols = [col for col in combined.columns if col.startswith('spread_')]
+            combined = combined.dropna(subset=spread_cols, how='all')
+
+            _macro_cache[cache_key] = combined
+            print(f"✅ Macro data fetched: {len(combined)} rows")
+            return combined
+        except Exception as e:
+            print(f"❌ Error fetching macro data: {e}")
+            import traceback
+            traceback.print_exc()
+            return pd.DataFrame()
+
 # ---------- Commodity Data Cache ----------
 _commodity_cache = {}
 _commodity_lock = threading.Lock()
 
 def fetch_commodity_data(start_date, end_date):
-    """Fetch commodity prices once and cache them."""
+    """Fetch commodity prices with fallback."""
     global _commodity_cache
     with _commodity_lock:
         cache_key = f"{start_date}_{end_date}"
@@ -562,23 +656,26 @@ def fetch_commodity_data(start_date, end_date):
             return _commodity_cache[cache_key]
         try:
             print("📊 Fetching commodity data...")
-            symbols = {
-                'crude_oil': 'CL=F',
-                'gold': 'GC=F',
-                'agri': 'DBA'  # proxy for dairy/agriculture
-            }
+            symbols = {'crude_oil': 'CL=F', 'gold': 'GC=F', 'agri': 'DBA'}
             combined = pd.DataFrame()
             for name, symbol in symbols.items():
-                data = yf.download(symbol, start=start_date, end=end_date, progress=False, timeout=60)
-                if not data.empty:
-                    # Use adjusted close if available, else close
-                    price = data['Adj Close'] if 'Adj Close' in data.columns else data['Close']
-                    price = price.rename(name)
-                    if combined.empty:
-                        combined = price.to_frame()
-                    else:
-                        combined = combined.join(price, how='outer')
-            # Forward fill and drop rows with all NaN
+                try:
+                    data = yf.download(symbol, start=start_date, end=end_date, progress=False, timeout=60)
+                    if not data.empty:
+                        price_series = data['Adj Close'] if 'Adj Close' in data.columns else data['Close']
+                        if isinstance(price_series, pd.DataFrame):
+                            price_series = price_series.iloc[:, 0]
+                        price_series.name = name
+                        if combined.empty:
+                            combined = price_series.to_frame()
+                        else:
+                            combined = combined.join(price_series, how='outer')
+                except Exception as e:
+                    print(f"⚠️ Could not fetch {name} ({symbol}): {e}")
+                    combined[name] = np.nan
+            if combined.empty:
+                print("⚠️ No commodity data fetched.")
+                return pd.DataFrame()
             combined = combined.ffill()
             combined = combined.dropna(how='all')
             _commodity_cache[cache_key] = combined
@@ -586,6 +683,8 @@ def fetch_commodity_data(start_date, end_date):
             return combined
         except Exception as e:
             print(f"❌ Error fetching commodity data: {e}")
+            import traceback
+            traceback.print_exc()
             return pd.DataFrame()
 
 # ---------- Pattern Recognition ----------
@@ -762,23 +861,37 @@ def retrain_model():
             now = datetime.now()
             start_of_year = datetime(now.year, 1, 1)
 
-            # Fetch commodity data once
+            # Fetch macro and commodity data once
+            macro_df = fetch_macro_data(start_of_year.strftime('%Y-%m-%d'), now.strftime('%Y-%m-%d'))
             commodity_df = fetch_commodity_data(start_of_year.strftime('%Y-%m-%d'), now.strftime('%Y-%m-%d'))
 
             for pair in _RETRAIN_PAIRS:
                 df = fetch_data(pair, start_of_year.strftime('%Y-%m-%d'), now.strftime('%Y-%m-%d'), '1h')
                 if not df.empty:
-                    # Reset index to make date a column for merging
+                    # Reset index and rename whatever the index column ended up being
+                    # (yfinance calls it 'Date' for daily bars, 'Datetime' for intraday
+                    # bars, and sometimes just 'index' — rename by position so it works
+                    # regardless of interval).
                     df = df.reset_index()
+                    df.rename(columns={df.columns[0]: 'Date'}, inplace=True)
+                    df['Date'] = pd.to_datetime(df['Date'])
+
+                    # Merge macro data (spreads)
+                    if not macro_df.empty:
+                        macro_df.index = pd.to_datetime(macro_df.index)
+                        df = df.merge(macro_df, left_on='Date', right_index=True, how='left')
+                        for col in macro_df.columns:
+                            if col in df.columns:
+                                df[col] = df[col].ffill()
+
+                    # Merge commodity data
                     if not commodity_df.empty:
-                        # Merge commodity data on date
-                        df['Date'] = pd.to_datetime(df['Date'])
                         commodity_df.index = pd.to_datetime(commodity_df.index)
                         df = df.merge(commodity_df, left_on='Date', right_index=True, how='left')
-                        # Forward fill commodity columns (in case of missing days)
                         for col in ['crude_oil', 'gold', 'agri']:
                             if col in df.columns:
                                 df[col] = df[col].ffill()
+
                     all_dfs.append(df)
 
             if not all_dfs:
@@ -786,8 +899,12 @@ def retrain_model():
                 return False
 
             combined = pd.concat(all_dfs, ignore_index=True)
-            combined = combined.drop(columns=['Date']) if 'Date' in combined.columns else combined
-            combined = combined.drop(columns=['index']) if 'index' in combined.columns else combined
+            # Remove the 'Date' column as it's no longer needed
+            if 'Date' in combined.columns:
+                combined = combined.drop(columns=['Date'])
+            # Also drop any 'index' column if present
+            if 'index' in combined.columns:
+                combined = combined.drop(columns=['index'])
 
             success = pattern_model.train(combined)
             if success:
@@ -902,22 +1019,34 @@ def process_pair(pair, interval, atr_period, risk_mult, reward_ratio):
         if df.empty or len(df) < 60:
             return None
 
-        # Add commodity features to the live signal dataframe
-        # For live signals, we use the most recent commodity prices
-        # We'll fetch today's commodity data separately
-        commodity_df = fetch_commodity_data((datetime.now() - timedelta(days=5)).strftime('%Y-%m-%d'), datetime.now().strftime('%Y-%m-%d'))
+        # Add macro and commodity features for live signals.
+        # NOTE: several of the FRED international bond-yield series are only
+        # published monthly, and even VIX/commodities can gap over weekends.
+        # A narrow window here reliably returns 0 rows for those series (they
+        # just never publish within the window), which then propagates as
+        # all-NaN feature columns into the model. Fetch a wide historical
+        # window instead — we only ever use the *latest* row (see below), so
+        # this just guarantees there's actually a recent data point to find,
+        # and it's cheap since fetch_macro_data/fetch_commodity_data cache by
+        # date-range key.
+        macro_start = (datetime.now() - timedelta(days=400)).strftime('%Y-%m-%d')
+        macro_end = datetime.now().strftime('%Y-%m-%d')
+        macro_df = fetch_macro_data(macro_start, macro_end)
+        commodity_df = fetch_commodity_data(macro_start, macro_end)
+
+        # Add latest macro spreads
+        if not macro_df.empty:
+            latest = macro_df.iloc[-1]
+            for col in macro_df.columns:
+                df[col] = latest.get(col, np.nan)
+            df = df.ffill()
+
+        # Add latest commodity prices
         if not commodity_df.empty:
-            # Add last known commodity prices to the dataframe
-            # We'll just add the latest values as constant columns (since we only need the latest)
-            # Alternatively, we could merge by date if we have intraday data, but for simplicity we use last known daily
-            latest = commodity_df.iloc[-1] if not commodity_df.empty else None
-            if latest is not None:
-                df['crude_oil'] = latest.get('crude_oil', np.nan)
-                df['gold'] = latest.get('gold', np.nan)
-                df['agri'] = latest.get('agri', np.nan)
-                # Forward fill to avoid NaN
-                for col in ['crude_oil', 'gold', 'agri']:
-                    df[col] = df[col].ffill()
+            latest = commodity_df.iloc[-1]
+            for col in ['crude_oil', 'gold', 'agri']:
+                df[col] = latest.get(col, np.nan)
+            df = df.ffill()
 
         df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=atr_period)
         df = df.dropna()

@@ -12,7 +12,6 @@ from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore')
 
-# Optional imbalanced-learn
 try:
     from imblearn.over_sampling import SMOTE
     SMOTE_AVAILABLE = True
@@ -40,14 +39,22 @@ class PatternModel:
             'roc_10', 'roc_20',
             'returns_std_10', 'returns_skew_10', 'returns_kurt_10',
 
-            # Momentum indicators
+            # Momentum
             'stoch_k', 'stoch_d', 'williams_r', 'cci_20', 'adx_14',
 
-            # Volatility indicators
+            # Volatility
             'volatility_20', 'volatility_ratio',
 
-            # ---- NEW: Commodity features ----
-            'crude_oil', 'gold', 'agri'
+            # Commodities
+            'crude_oil', 'gold', 'agri',
+
+            # ---- Macro: yield spreads ----
+            'spread_us_de', 'spread_us_uk', 'spread_us_au', 'spread_us_ca',
+            'spread_us_ch', 'spread_de_uk', 'spread_de_jp', 'spread_us_nz',
+            'spread_uk_jp', 'spread_us_jp',
+
+            # ---- Macro: VIX ----
+            'vix'
         ]
         self.load_latest_model()
 
@@ -114,7 +121,7 @@ class PatternModel:
             data = {
                 'model_blob': blob_b64,
                 'created_at': datetime.now().isoformat(),
-                'version': '9.0'   # commodity features added
+                'version': '10.0'
             }
             self.supabase.table('pattern_models').insert(data)
             self.current_val_acc = validation_acc
@@ -148,7 +155,7 @@ class PatternModel:
         df['returns_skew_10'] = ret.rolling(10).skew()
         df['returns_kurt_10'] = ret.rolling(10).kurt()
 
-        # ---- Momentum indicators ----
+        # ---- Momentum ----
         stoch = ta.stoch(df['high'], df['low'], df['close'], k=14, d=3)
         if stoch is not None and not stoch.empty:
             df['stoch_k'] = stoch.get('STOCHk_14_3_3', np.nan)
@@ -162,7 +169,7 @@ class PatternModel:
         adx = ta.adx(df['high'], df['low'], df['close'], length=14)
         df['adx_14'] = adx['ADX_14'] if adx is not None else np.nan
 
-        # ---- Volatility indicators ----
+        # ---- Volatility ----
         df['volatility_20'] = ret.rolling(20).std()
         df['volatility_ratio'] = df['volatility_20'] / df['volatility_20'].rolling(10).mean()
         df['volatility_ratio'] = df['volatility_ratio'].replace([np.inf, -np.inf], np.nan)
@@ -174,23 +181,42 @@ class PatternModel:
             df[f'low_prev_{lag}'] = df['low'].shift(lag)
             df[f'close_prev_{lag}'] = df['close'].shift(lag)
 
-        # ---- Commodity features are already in df (merged earlier) ----
-        # Ensure they exist and forward-fill in case of missing
-        for col in ['crude_oil', 'gold', 'agri']:
+        # ---- Commodity & Macro features ----
+        for col in self.feature_columns:
             if col not in df.columns:
                 df[col] = np.nan
             else:
                 df[col] = df[col].ffill()
 
-        df_clean = df.dropna()
+        # Diagnostic: dropna() below drops on ANY NaN across the whole frame,
+        # so a single all-NaN feature column (e.g. a failed macro/VIX fetch)
+        # would silently wipe every row and make training look like "not
+        # enough data" with no explanation. Surface that here instead.
+        nan_frac = df[self.feature_columns].isna().mean()
+        bad_cols = nan_frac[nan_frac > 0.95]
+        if not bad_cols.empty:
+            print(f"⚠️ prepare_features: dropping unusable (mostly-NaN) columns: {list(bad_cols.index)}")
+            df = df.drop(columns=list(bad_cols.index))
+
+        usable_features = [c for c in self.feature_columns if c in df.columns]
+        df_clean = df.dropna(subset=usable_features)
         if df_clean.empty:
+            print("⚠️ prepare_features: no rows left after dropping NaNs — check data feeds.")
             return None, None
-        X = df_clean[self.feature_columns].values
+        X = df_clean[usable_features].values
         if self.selected_features is not None:
-            X = X[:, self.selected_features]
+            # selected_features are positional indices into the ORIGINAL
+            # self.feature_columns ordering — only valid if no columns were
+            # dropped above. If the feature set shrank, force reselection
+            # rather than silently indexing into the wrong columns.
+            if len(usable_features) == len(self.feature_columns):
+                X = X[:, self.selected_features]
+            else:
+                print("⚠️ prepare_features: feature set changed since last selection; "
+                      "ignoring cached selected_features for this call.")
         return X, df_clean.index
 
-    def feature_selection(self, X, y, n_features=15):
+    def feature_selection(self, X, y, n_features=20):
         from sklearn.ensemble import RandomForestClassifier
         rf = RandomForestClassifier(n_estimators=100, class_weight='balanced', random_state=42)
         rf.fit(X, y)
@@ -222,7 +248,7 @@ class PatternModel:
             return False
 
         if self.selected_features is None:
-            self.selected_features = self.feature_selection(X_bin, y_bin, n_features=15)
+            self.selected_features = self.feature_selection(X_bin, y_bin, n_features=20)
             X_bin = X_bin[:, self.selected_features]
             X = X[:, self.selected_features]
 
