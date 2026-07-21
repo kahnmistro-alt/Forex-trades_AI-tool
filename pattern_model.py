@@ -24,18 +24,27 @@ class PatternModel:
     def __init__(self, supabase_client):
         self.supabase = supabase_client
         self.scaler = StandardScaler()
-        self.svm = None          # only SVM, no ensemble
+        self.svm = None
         self.hmm_model = None
         self.selected_features = None
         self.current_val_acc = 0.0
         self.feature_columns = [
-            'open', 'high', 'low', 'close', 'volume',
+            # OHLC + lags
+            'open', 'high', 'low', 'close',
             'open_prev_1', 'high_prev_1', 'low_prev_1', 'close_prev_1',
             'open_prev_2', 'high_prev_2', 'low_prev_2', 'close_prev_2',
+
+            # Standard indicators
             'rsi_14', 'macd', 'atr_14',
             'bb_upper', 'bb_middle', 'bb_lower', 'bb_width',
             'roc_10', 'roc_20',
-            'returns_std_10', 'returns_skew_10', 'returns_kurt_10'
+            'returns_std_10', 'returns_skew_10', 'returns_kurt_10',
+
+            # ---- New momentum indicators ----
+            'stoch_k', 'stoch_d', 'williams_r', 'cci_20', 'adx_14',
+
+            # ---- New volatility indicators ----
+            'volatility_20', 'volatility_ratio',
         ]
         self.load_latest_model()
 
@@ -102,7 +111,7 @@ class PatternModel:
             data = {
                 'model_blob': blob_b64,
                 'created_at': datetime.now().isoformat(),
-                'version': '7.0'   # pure SVM+HMM
+                'version': '8.0'   # extended features
             }
             self.supabase.table('pattern_models').insert(data)
             self.current_val_acc = validation_acc
@@ -116,6 +125,8 @@ class PatternModel:
         if len(df) < 20:
             return None, None
         df = df.copy()
+
+        # ---- Existing indicators ----
         df['rsi_14'] = ta.rsi(df['close'], length=14)
         macd_df = ta.macd(df['close'], fast=12, slow=26, signal=9)
         df['macd'] = macd_df['MACD_12_26_9'] if macd_df is not None else 0
@@ -133,11 +144,33 @@ class PatternModel:
         df['returns_std_10'] = ret.rolling(10).std()
         df['returns_skew_10'] = ret.rolling(10).skew()
         df['returns_kurt_10'] = ret.rolling(10).kurt()
+
+        # ---- New momentum indicators ----
+        stoch = ta.stoch(df['high'], df['low'], df['close'], k=14, d=3)
+        if stoch is not None and not stoch.empty:
+            df['stoch_k'] = stoch.get('STOCHk_14_3_3', np.nan)
+            df['stoch_d'] = stoch.get('STOCHd_14_3_3', np.nan)
+        else:
+            df['stoch_k'] = np.nan
+            df['stoch_d'] = np.nan
+
+        df['williams_r'] = ta.willr(df['high'], df['low'], df['close'], length=14)
+        df['cci_20'] = ta.cci(df['high'], df['low'], df['close'], length=20)
+        adx = ta.adx(df['high'], df['low'], df['close'], length=14)
+        df['adx_14'] = adx['ADX_14'] if adx is not None else np.nan
+
+        # ---- New volatility indicators ----
+        df['volatility_20'] = ret.rolling(20).std()
+        df['volatility_ratio'] = df['volatility_20'] / df['volatility_20'].rolling(10).mean()
+        df['volatility_ratio'] = df['volatility_ratio'].replace([np.inf, -np.inf], np.nan)
+
+        # ---- Lags ----
         for lag in [1, 2]:
             df[f'open_prev_{lag}'] = df['open'].shift(lag)
             df[f'high_prev_{lag}'] = df['high'].shift(lag)
             df[f'low_prev_{lag}'] = df['low'].shift(lag)
             df[f'close_prev_{lag}'] = df['close'].shift(lag)
+
         df_clean = df.dropna()
         if df_clean.empty:
             return None, None
@@ -147,7 +180,6 @@ class PatternModel:
         return X, df_clean.index
 
     def feature_selection(self, X, y, n_features=15):
-        # Use a simple RandomForest just for importance (not part of final model)
         from sklearn.ensemble import RandomForestClassifier
         rf = RandomForestClassifier(n_estimators=100, class_weight='balanced', random_state=42)
         rf.fit(X, y)
@@ -178,19 +210,13 @@ class PatternModel:
             print("Not enough trading samples for training.")
             return False
 
-        # Feature selection (if not already set)
         if self.selected_features is None:
             self.selected_features = self.feature_selection(X_bin, y_bin, n_features=15)
             X_bin = X_bin[:, self.selected_features]
             X = X[:, self.selected_features]
-        else:
-            # already reduced
-            pass
 
-        # Train/test split
         X_train, X_val, y_train, y_val = train_test_split(X_bin, y_bin, test_size=0.2, random_state=42, stratify=y_bin)
 
-        # Balance
         if SMOTE_AVAILABLE:
             smote = SMOTE(random_state=42)
             X_train_res, y_train_res = smote.fit_resample(X_train, y_train)
@@ -204,7 +230,6 @@ class PatternModel:
         X_val_scaled = self.scaler.transform(X_val)
         X_all_scaled = self.scaler.transform(X)
 
-        # ---- SVM with GridSearch ----
         param_grid = {'C': [0.1, 1, 10], 'gamma': ['scale', 'auto', 0.01, 0.1]}
         svm = SVC(kernel='rbf', class_weight='balanced', probability=True, random_state=42)
         grid = GridSearchCV(svm, param_grid, cv=3, scoring='accuracy', n_jobs=-1)
@@ -213,7 +238,6 @@ class PatternModel:
         val_acc = accuracy_score(y_val, best_svm.predict(X_val_scaled))
         print(f"Best SVM params: {grid.best_params_} (val acc: {val_acc:.3f})")
 
-        # ---- HMM with multiple states ----
         best_hmm = None
         best_score = -np.inf
         for n_comp in [2, 3, 4]:
@@ -246,11 +270,10 @@ class PatternModel:
         state_probs = self.hmm_model.predict_proba(last_X_scaled)[0]
         dominant_state = np.argmax(state_probs)
 
-        # Regime‑adjustment
         if svm_pred == 1:
-            if dominant_state == 2:      # uptrend
+            if dominant_state == 2:
                 ml_conf = min(1.0, ml_conf + 0.15)
-            elif dominant_state == 0:    # downtrend
+            elif dominant_state == 0:
                 ml_conf = max(0.0, ml_conf - 0.15)
         else:
             if dominant_state == 0:
@@ -258,17 +281,13 @@ class PatternModel:
             elif dominant_state == 2:
                 ml_conf = max(0.0, ml_conf - 0.15)
 
-        if ml_conf > 0.6:
+        if ml_conf > 0.7:
             signal = 'BUY' if svm_pred == 1 else 'SELL'
         else:
             signal = 'HOLD'
         return signal, float(ml_conf)
 
     def fuse_signals(self, ml_signal, ml_conf, rule_signal, rule_conf, rule_weight):
-        """
-        Blend ML and rule signals using dynamic weight.
-        rule_weight: fraction of rule confidence (0..1), rest is ML.
-        """
         if ml_signal == 'HOLD' and rule_signal == 'HOLD':
             return 'HOLD', 0.0
         if ml_signal == 'HOLD':

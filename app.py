@@ -30,7 +30,7 @@ app = Flask(__name__)
 
 # ---------- Best parameters from backtest ----------
 RISK_ATR = 1.0
-MIN_CONFIDENCE = 0.6
+MIN_CONFIDENCE = 0.7                     # Changed from 0.6 to 0.7
 REWARD_RATIO = 3.0
 AUTO_TRADE_PAIRS = ['USDJPY', 'GBPUSD']
 
@@ -424,7 +424,7 @@ CREATE TABLE IF NOT EXISTS config (
     value FLOAT
 );
 
-INSERT INTO config (key, value) VALUES ('min_confidence', 0.6)
+INSERT INTO config (key, value) VALUES ('min_confidence', 0.7)  -- Changed to 0.7
 ON CONFLICT (key) DO NOTHING;
 
 INSERT INTO config (key, value) VALUES ('rule_weight', 0.3)
@@ -433,7 +433,7 @@ ON CONFLICT (key) DO NOTHING;
 CREATE INDEX IF NOT EXISTS idx_trades_result ON trades(result);
 CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp);
         """)
-        print("The app will continue with default confidence (0.6).")
+        print("The app will continue with default confidence (0.7).")
     else:
         print("✅ Tables 'trades' and 'config' already exist.")
 
@@ -454,8 +454,8 @@ CREATE TABLE IF NOT EXISTS pattern_models (
 def get_min_confidence():
     ok, result = supabase_request('GET', 'config?key=eq.min_confidence')
     if ok and result:
-        return result[0].get('value', 0.6)
-    return 0.6
+        return result[0].get('value', 0.7)   # default to 0.7
+    return 0.7
 
 def update_min_confidence(new_val):
     supabase_request('PATCH', 'config?key=eq.min_confidence', {'value': new_val})
@@ -852,6 +852,12 @@ def process_pair(pair, interval, atr_period, risk_mult, reward_ratio):
         with _rule_weight_lock:
             rw = _rule_weight
         final_signal, final_conf = pattern_model.fuse_signals(ml_signal, ml_conf, rule_signal, rule_conf, rw)
+
+        # --- Enforce minimum confidence (0.7) ---
+        min_conf = get_min_confidence()
+        if final_conf < min_conf:
+            final_signal = 'HOLD'
+            final_conf = 0.0
 
         # Determine source for logging
         if final_signal == 'HOLD':
