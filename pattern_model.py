@@ -3,7 +3,6 @@ import base64
 import numpy as np
 import pandas as pd
 from sklearn.svm import SVC
-from sklearn.ensemble import RandomForestClassifier, VotingClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import GridSearchCV, train_test_split
 from sklearn.metrics import accuracy_score
@@ -21,20 +20,12 @@ except ImportError:
     SMOTE_AVAILABLE = False
     print("ℹ️ imbalanced-learn not installed. Using class_weight='balanced' only (no SMOTE).")
 
-# Optional XGBoost
-try:
-    from xgboost import XGBClassifier
-    XGB_AVAILABLE = True
-except ImportError:
-    XGB_AVAILABLE = False
-
 class PatternModel:
     def __init__(self, supabase_client):
         self.supabase = supabase_client
         self.scaler = StandardScaler()
-        self.voting_clf = None
+        self.svm = None          # only SVM, no ensemble
         self.hmm_model = None
-        self.n_states = 3
         self.selected_features = None
         self.current_val_acc = 0.0
         self.feature_columns = [
@@ -49,7 +40,6 @@ class PatternModel:
         self.load_latest_model()
 
     def load_latest_model(self):
-        """Load the most recent model from Supabase. Return True if loaded, False otherwise."""
         try:
             resp = self.supabase.table('pattern_models') \
                 .select('*') \
@@ -64,36 +54,36 @@ class PatternModel:
             blob = base64.b64decode(blob_b64)
             data = pickle.loads(blob)
 
-            required_keys = ['scaler', 'voting_clf', 'hmm', 'selected_features', 'val_acc']
+            required_keys = ['scaler', 'svm', 'hmm', 'selected_features', 'val_acc']
             for key in required_keys:
                 if key not in data:
                     raise KeyError(f"Missing key '{key}' in model data. Old model format?")
             
             self.scaler = data['scaler']
-            self.voting_clf = data['voting_clf']
+            self.svm = data['svm']
             self.hmm_model = data['hmm']
             self.selected_features = data['selected_features']
             self.current_val_acc = data['val_acc']
-            print(f"✅ Ensemble model loaded from Supabase (val acc: {self.current_val_acc:.3f})")
+            print(f"✅ SVM+HMM model loaded from Supabase (val acc: {self.current_val_acc:.3f})")
             return True
 
         except KeyError as e:
             print(f"⚠️ Model loading failed due to missing key: {e}. Will retrain a new model.")
-            self.voting_clf = None
+            self.svm = None
             self.hmm_model = None
             self.selected_features = None
             self.current_val_acc = 0.0
             return False
         except Exception as e:
             print(f"⚠️ Failed to load model: {e}. Will retrain a new model.")
-            self.voting_clf = None
+            self.svm = None
             self.hmm_model = None
             self.selected_features = None
             self.current_val_acc = 0.0
             return False
 
     def save_model(self, validation_acc):
-        if self.voting_clf is None or self.hmm_model is None:
+        if self.svm is None or self.hmm_model is None:
             print("No model to save.")
             return False
         if validation_acc <= self.current_val_acc:
@@ -102,7 +92,7 @@ class PatternModel:
         try:
             save_data = {
                 'scaler': self.scaler,
-                'voting_clf': self.voting_clf,
+                'svm': self.svm,
                 'hmm': self.hmm_model,
                 'selected_features': self.selected_features,
                 'val_acc': validation_acc
@@ -112,11 +102,11 @@ class PatternModel:
             data = {
                 'model_blob': blob_b64,
                 'created_at': datetime.now().isoformat(),
-                'version': '6.0'
+                'version': '7.0'   # pure SVM+HMM
             }
             self.supabase.table('pattern_models').insert(data)
             self.current_val_acc = validation_acc
-            print(f"✅ Ensemble model saved to Supabase (val acc: {validation_acc:.3f}).")
+            print(f"✅ SVM+HMM model saved to Supabase (val acc: {validation_acc:.3f}).")
             return True
         except Exception as e:
             print(f"❌ Failed to save model: {e}")
@@ -157,6 +147,8 @@ class PatternModel:
         return X, df_clean.index
 
     def feature_selection(self, X, y, n_features=15):
+        # Use a simple RandomForest just for importance (not part of final model)
+        from sklearn.ensemble import RandomForestClassifier
         rf = RandomForestClassifier(n_estimators=100, class_weight='balanced', random_state=42)
         rf.fit(X, y)
         importances = rf.feature_importances_
@@ -186,21 +178,19 @@ class PatternModel:
             print("Not enough trading samples for training.")
             return False
 
-        # ----- Feature selection -----
-        # If we don't have selected_features yet, perform selection on full feature set (25 features)
+        # Feature selection (if not already set)
         if self.selected_features is None:
             self.selected_features = self.feature_selection(X_bin, y_bin, n_features=15)
-            # Now reduce X_bin and X to selected features
             X_bin = X_bin[:, self.selected_features]
             X = X[:, self.selected_features]
         else:
-            # X already has selected features from prepare_features, so we use it as is
+            # already reduced
             pass
 
-        # ----- Train/test split -----
+        # Train/test split
         X_train, X_val, y_train, y_val = train_test_split(X_bin, y_bin, test_size=0.2, random_state=42, stratify=y_bin)
 
-        # ----- Handle imbalance -----
+        # Balance
         if SMOTE_AVAILABLE:
             smote = SMOTE(random_state=42)
             X_train_res, y_train_res = smote.fit_resample(X_train, y_train)
@@ -214,49 +204,16 @@ class PatternModel:
         X_val_scaled = self.scaler.transform(X_val)
         X_all_scaled = self.scaler.transform(X)
 
-        # ----- SVM tuning -----
+        # ---- SVM with GridSearch ----
         param_grid = {'C': [0.1, 1, 10], 'gamma': ['scale', 'auto', 0.01, 0.1]}
         svm = SVC(kernel='rbf', class_weight='balanced', probability=True, random_state=42)
         grid = GridSearchCV(svm, param_grid, cv=3, scoring='accuracy', n_jobs=-1)
         grid.fit(X_train_scaled, y_train_res)
         best_svm = grid.best_estimator_
-        svm_val_acc = accuracy_score(y_val, best_svm.predict(X_val_scaled))
-        print(f"Best SVM params: {grid.best_params_} (val acc: {svm_val_acc:.3f})")
+        val_acc = accuracy_score(y_val, best_svm.predict(X_val_scaled))
+        print(f"Best SVM params: {grid.best_params_} (val acc: {val_acc:.3f})")
 
-        # ----- Random Forest -----
-        rf = RandomForestClassifier(n_estimators=100, max_depth=10, class_weight='balanced', random_state=42)
-        rf.fit(X_train_scaled, y_train_res)
-        rf_val_acc = accuracy_score(y_val, rf.predict(X_val_scaled))
-        print(f"Random Forest val acc: {rf_val_acc:.3f}")
-
-        # ----- XGBoost -----
-        if XGB_AVAILABLE:
-            neg_count = np.sum(y_train_res == 0)
-            pos_count = np.sum(y_train_res == 1)
-            scale_pos_weight = neg_count / pos_count if pos_count > 0 else 1.0
-            xgb = XGBClassifier(n_estimators=100, max_depth=6, learning_rate=0.1,
-                                scale_pos_weight=scale_pos_weight,
-                                use_label_encoder=False, eval_metric='logloss',
-                                random_state=42)
-            xgb.fit(X_train_scaled, y_train_res)
-            xgb_val_acc = accuracy_score(y_val, xgb.predict(X_val_scaled))
-            print(f"XGBoost val acc: {xgb_val_acc:.3f}")
-        else:
-            xgb = None
-            xgb_val_acc = 0.0
-
-        # ----- Ensemble -----
-        estimators = [('svm', best_svm), ('rf', rf)]
-        if xgb is not None:
-            estimators.append(('xgb', xgb))
-        weights = np.array([svm_val_acc, rf_val_acc, xgb_val_acc] if xgb is not None else [svm_val_acc, rf_val_acc])
-        weights = weights / weights.sum()
-        voting_clf = VotingClassifier(estimators=estimators, voting='soft', weights=weights)
-        voting_clf.fit(X_train_scaled, y_train_res)
-        val_acc = accuracy_score(y_val, voting_clf.predict(X_val_scaled))
-        print(f"Voting Ensemble val acc: {val_acc:.3f}")
-
-        # ----- HMM tuning -----
+        # ---- HMM with multiple states ----
         best_hmm = None
         best_score = -np.inf
         for n_comp in [2, 3, 4]:
@@ -268,13 +225,13 @@ class PatternModel:
                 best_hmm = hmm_model
         print(f"HMM chosen with {best_hmm.n_components} states (log-lik: {best_score:.2f})")
 
-        self.voting_clf = voting_clf
+        self.svm = best_svm
         self.hmm_model = best_hmm
         self.save_model(val_acc)
         return True
 
     def predict_pattern(self, df):
-        if self.voting_clf is None or self.hmm_model is None:
+        if self.svm is None or self.hmm_model is None:
             return 'HOLD', 0.0
         X, idx = self.prepare_features(df)
         if X is None or len(X) == 0:
@@ -282,17 +239,18 @@ class PatternModel:
         last_X = X[-1].reshape(1, -1)
         last_X_scaled = self.scaler.transform(last_X)
 
-        ml_prob = self.voting_clf.predict_proba(last_X_scaled)[0]
-        ml_pred = self.voting_clf.predict(last_X_scaled)[0]
-        ml_conf = ml_prob[1] if ml_pred == 1 else ml_prob[0]
+        svm_prob = self.svm.predict_proba(last_X_scaled)[0]
+        svm_pred = self.svm.predict(last_X_scaled)[0]
+        ml_conf = svm_prob[1] if svm_pred == 1 else svm_prob[0]
 
         state_probs = self.hmm_model.predict_proba(last_X_scaled)[0]
         dominant_state = np.argmax(state_probs)
 
-        if ml_pred == 1:
-            if dominant_state == 2:
+        # Regime‑adjustment
+        if svm_pred == 1:
+            if dominant_state == 2:      # uptrend
                 ml_conf = min(1.0, ml_conf + 0.15)
-            elif dominant_state == 0:
+            elif dominant_state == 0:    # downtrend
                 ml_conf = max(0.0, ml_conf - 0.15)
         else:
             if dominant_state == 0:
@@ -301,7 +259,7 @@ class PatternModel:
                 ml_conf = max(0.0, ml_conf - 0.15)
 
         if ml_conf > 0.6:
-            signal = 'BUY' if ml_pred == 1 else 'SELL'
+            signal = 'BUY' if svm_pred == 1 else 'SELL'
         else:
             signal = 'HOLD'
         return signal, float(ml_conf)
