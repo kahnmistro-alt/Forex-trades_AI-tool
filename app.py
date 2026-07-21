@@ -30,7 +30,7 @@ app = Flask(__name__)
 
 # ---------- Best parameters from backtest ----------
 RISK_ATR = 1.0
-MIN_CONFIDENCE = 0.7                     # Changed from 0.6 to 0.7
+MIN_CONFIDENCE = 0.7
 REWARD_RATIO = 3.0
 AUTO_TRADE_PAIRS = ['USDJPY', 'GBPUSD']
 
@@ -424,7 +424,7 @@ CREATE TABLE IF NOT EXISTS config (
     value FLOAT
 );
 
-INSERT INTO config (key, value) VALUES ('min_confidence', 0.7)  -- Changed to 0.7
+INSERT INTO config (key, value) VALUES ('min_confidence', 0.7)
 ON CONFLICT (key) DO NOTHING;
 
 INSERT INTO config (key, value) VALUES ('rule_weight', 0.3)
@@ -454,7 +454,7 @@ CREATE TABLE IF NOT EXISTS pattern_models (
 def get_min_confidence():
     ok, result = supabase_request('GET', 'config?key=eq.min_confidence')
     if ok and result:
-        return result[0].get('value', 0.7)   # default to 0.7
+        return result[0].get('value', 0.7)
     return 0.7
 
 def update_min_confidence(new_val):
@@ -708,19 +708,21 @@ _RETRAIN_INTERVAL_HOURS = 6
 _RETRAIN_PAIRS = ['EURUSD=X', 'GBPUSD=X', 'AUDUSD=X', 'USDCAD=X']
 
 def retrain_model():
-    """Fetch fresh data and retrain the ensemble model."""
+    """Fetch fresh data from the start of the year and retrain the SVM+HMM model."""
     with _retraining_lock:
         print("🔄 Starting model retraining...")
         try:
             all_dfs = []
+            now = datetime.now()
+            start_of_year = datetime(now.year, 1, 1)  # Jan 1 of current year
+
             for pair in _RETRAIN_PAIRS:
-                end = datetime.now()
-                start = end - timedelta(days=90)  # enough for ~2000 hourly bars
-                df = fetch_data(pair, start.strftime('%Y-%m-%d'), end.strftime('%Y-%m-%d'), '1h')
+                df = fetch_data(pair, start_of_year.strftime('%Y-%m-%d'), now.strftime('%Y-%m-%d'), '1h')
                 if not df.empty:
                     # Keep timestamp as column, reset index
                     df = df.reset_index()
                     all_dfs.append(df)
+
             if not all_dfs:
                 print("❌ No data for retraining.")
                 return False
