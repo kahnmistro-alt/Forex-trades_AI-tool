@@ -40,11 +40,14 @@ class PatternModel:
             'roc_10', 'roc_20',
             'returns_std_10', 'returns_skew_10', 'returns_kurt_10',
 
-            # ---- New momentum indicators ----
+            # Momentum indicators
             'stoch_k', 'stoch_d', 'williams_r', 'cci_20', 'adx_14',
 
-            # ---- New volatility indicators ----
+            # Volatility indicators
             'volatility_20', 'volatility_ratio',
+
+            # ---- NEW: Commodity features ----
+            'crude_oil', 'gold', 'agri'
         ]
         self.load_latest_model()
 
@@ -111,7 +114,7 @@ class PatternModel:
             data = {
                 'model_blob': blob_b64,
                 'created_at': datetime.now().isoformat(),
-                'version': '8.0'   # extended features
+                'version': '9.0'   # commodity features added
             }
             self.supabase.table('pattern_models').insert(data)
             self.current_val_acc = validation_acc
@@ -145,7 +148,7 @@ class PatternModel:
         df['returns_skew_10'] = ret.rolling(10).skew()
         df['returns_kurt_10'] = ret.rolling(10).kurt()
 
-        # ---- New momentum indicators ----
+        # ---- Momentum indicators ----
         stoch = ta.stoch(df['high'], df['low'], df['close'], k=14, d=3)
         if stoch is not None and not stoch.empty:
             df['stoch_k'] = stoch.get('STOCHk_14_3_3', np.nan)
@@ -159,7 +162,7 @@ class PatternModel:
         adx = ta.adx(df['high'], df['low'], df['close'], length=14)
         df['adx_14'] = adx['ADX_14'] if adx is not None else np.nan
 
-        # ---- New volatility indicators ----
+        # ---- Volatility indicators ----
         df['volatility_20'] = ret.rolling(20).std()
         df['volatility_ratio'] = df['volatility_20'] / df['volatility_20'].rolling(10).mean()
         df['volatility_ratio'] = df['volatility_ratio'].replace([np.inf, -np.inf], np.nan)
@@ -170,6 +173,14 @@ class PatternModel:
             df[f'high_prev_{lag}'] = df['high'].shift(lag)
             df[f'low_prev_{lag}'] = df['low'].shift(lag)
             df[f'close_prev_{lag}'] = df['close'].shift(lag)
+
+        # ---- Commodity features are already in df (merged earlier) ----
+        # Ensure they exist and forward-fill in case of missing
+        for col in ['crude_oil', 'gold', 'agri']:
+            if col not in df.columns:
+                df[col] = np.nan
+            else:
+                df[col] = df[col].ffill()
 
         df_clean = df.dropna()
         if df_clean.empty:

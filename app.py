@@ -32,7 +32,9 @@ app = Flask(__name__)
 RISK_ATR = 1.0
 MIN_CONFIDENCE = 0.7
 REWARD_RATIO = 3.0
-AUTO_TRADE_PAIRS = ['USDJPY', 'GBPUSD']
+ALL_PAIRS = ['EURUSD', 'GBPUSD', 'AUDUSD', 'USDCAD', 'USDCHF',
+             'EURGBP', 'EURJPY', 'NZDUSD', 'GBPJPY', 'USDJPY']
+AUTO_TRADE_PAIRS = ALL_PAIRS
 
 PYTRADER_SERVER = os.environ.get('PYTRADER_SERVER', 'localhost')
 PYTRADER_PORT = int(os.environ.get('PYTRADER_PORT', 1122))
@@ -546,6 +548,46 @@ def start_rule_weight_thread():
     thread.start()
     print("🚀 Rule‑weight update thread started.")
 
+# ---------- Commodity Data Cache ----------
+_commodity_cache = {}
+_commodity_lock = threading.Lock()
+
+def fetch_commodity_data(start_date, end_date):
+    """Fetch commodity prices once and cache them."""
+    global _commodity_cache
+    with _commodity_lock:
+        cache_key = f"{start_date}_{end_date}"
+        if cache_key in _commodity_cache:
+            print("ℹ️ Using cached commodity data.")
+            return _commodity_cache[cache_key]
+        try:
+            print("📊 Fetching commodity data...")
+            symbols = {
+                'crude_oil': 'CL=F',
+                'gold': 'GC=F',
+                'agri': 'DBA'  # proxy for dairy/agriculture
+            }
+            combined = pd.DataFrame()
+            for name, symbol in symbols.items():
+                data = yf.download(symbol, start=start_date, end=end_date, progress=False, timeout=60)
+                if not data.empty:
+                    # Use adjusted close if available, else close
+                    price = data['Adj Close'] if 'Adj Close' in data.columns else data['Close']
+                    price = price.rename(name)
+                    if combined.empty:
+                        combined = price.to_frame()
+                    else:
+                        combined = combined.join(price, how='outer')
+            # Forward fill and drop rows with all NaN
+            combined = combined.ffill()
+            combined = combined.dropna(how='all')
+            _commodity_cache[cache_key] = combined
+            print(f"✅ Commodity data fetched: {len(combined)} rows")
+            return combined
+        except Exception as e:
+            print(f"❌ Error fetching commodity data: {e}")
+            return pd.DataFrame()
+
 # ---------- Pattern Recognition ----------
 def get_date_ranges():
     now = datetime.now()
@@ -705,7 +747,11 @@ _retraining_lock = threading.Lock()
 _retraining_thread = None
 _auto_retrain_enabled = True
 _RETRAIN_INTERVAL_HOURS = 6
-_RETRAIN_PAIRS = ['EURUSD=X', 'GBPUSD=X', 'AUDUSD=X', 'USDCAD=X']
+_RETRAIN_PAIRS = [
+    'EURUSD=X', 'GBPUSD=X', 'AUDUSD=X', 'USDCAD=X',
+    'USDCHF=X', 'EURGBP=X', 'EURJPY=X', 'NZDUSD=X',
+    'GBPJPY=X', 'USDJPY=X'
+]
 
 def retrain_model():
     """Fetch fresh data from the start of the year and retrain the SVM+HMM model."""
@@ -714,13 +760,25 @@ def retrain_model():
         try:
             all_dfs = []
             now = datetime.now()
-            start_of_year = datetime(now.year, 1, 1)  # Jan 1 of current year
+            start_of_year = datetime(now.year, 1, 1)
+
+            # Fetch commodity data once
+            commodity_df = fetch_commodity_data(start_of_year.strftime('%Y-%m-%d'), now.strftime('%Y-%m-%d'))
 
             for pair in _RETRAIN_PAIRS:
                 df = fetch_data(pair, start_of_year.strftime('%Y-%m-%d'), now.strftime('%Y-%m-%d'), '1h')
                 if not df.empty:
-                    # Keep timestamp as column, reset index
+                    # Reset index to make date a column for merging
                     df = df.reset_index()
+                    if not commodity_df.empty:
+                        # Merge commodity data on date
+                        df['Date'] = pd.to_datetime(df['Date'])
+                        commodity_df.index = pd.to_datetime(commodity_df.index)
+                        df = df.merge(commodity_df, left_on='Date', right_index=True, how='left')
+                        # Forward fill commodity columns (in case of missing days)
+                        for col in ['crude_oil', 'gold', 'agri']:
+                            if col in df.columns:
+                                df[col] = df[col].ffill()
                     all_dfs.append(df)
 
             if not all_dfs:
@@ -728,6 +786,7 @@ def retrain_model():
                 return False
 
             combined = pd.concat(all_dfs, ignore_index=True)
+            combined = combined.drop(columns=['Date']) if 'Date' in combined.columns else combined
             combined = combined.drop(columns=['index']) if 'index' in combined.columns else combined
 
             success = pattern_model.train(combined)
@@ -842,6 +901,24 @@ def process_pair(pair, interval, atr_period, risk_mult, reward_ratio):
         df = fetch_data(pair, recent_start, recent_end, interval)
         if df.empty or len(df) < 60:
             return None
+
+        # Add commodity features to the live signal dataframe
+        # For live signals, we use the most recent commodity prices
+        # We'll fetch today's commodity data separately
+        commodity_df = fetch_commodity_data((datetime.now() - timedelta(days=5)).strftime('%Y-%m-%d'), datetime.now().strftime('%Y-%m-%d'))
+        if not commodity_df.empty:
+            # Add last known commodity prices to the dataframe
+            # We'll just add the latest values as constant columns (since we only need the latest)
+            # Alternatively, we could merge by date if we have intraday data, but for simplicity we use last known daily
+            latest = commodity_df.iloc[-1] if not commodity_df.empty else None
+            if latest is not None:
+                df['crude_oil'] = latest.get('crude_oil', np.nan)
+                df['gold'] = latest.get('gold', np.nan)
+                df['agri'] = latest.get('agri', np.nan)
+                # Forward fill to avoid NaN
+                for col in ['crude_oil', 'gold', 'agri']:
+                    df[col] = df[col].ffill()
+
         df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=atr_period)
         df = df.dropna()
         if df.empty:
@@ -1041,7 +1118,7 @@ def index():
 @app.route('/api/signals', methods=['POST'])
 def get_signals():
     data = request.get_json()
-    DEFAULT_PAIRS = 'EURUSD=X, GBPUSD=X, USDJPY=X, AUDUSD=X, USDCAD=X'
+    DEFAULT_PAIRS = ','.join([p + '=X' for p in ALL_PAIRS])
     pairs_raw = data.get('pairs', DEFAULT_PAIRS)
     pair_list = [p.strip().upper() for p in pairs_raw.split(',') if p.strip()]
     interval = data.get('interval', '1h')
@@ -1059,7 +1136,7 @@ def get_signals():
 @app.route('/api/autotrade', methods=['POST'])
 def auto_trade():
     data = request.get_json()
-    DEFAULT_PAIRS = 'EURUSD=X, GBPUSD=X, USDJPY=X, AUDUSD=X, USDCAD=X'
+    DEFAULT_PAIRS = ','.join([p + '=X' for p in ALL_PAIRS])
     pairs_raw = data.get('pairs', DEFAULT_PAIRS)
     pair_list = [p.strip().upper() for p in pairs_raw.split(',') if p.strip()]
     interval = data.get('interval', '1h')
@@ -1116,12 +1193,12 @@ def set_auto_trade_pairs():
     pairs_raw = data.get('pairs', '')
     if pairs_raw:
         pair_list = [p.strip().upper() for p in pairs_raw.split(',') if p.strip()]
-        allowed = ['USDJPY', 'GBPUSD']
-        auto_trade_pairs = [p.replace('=X', '') for p in pair_list if p.replace('=X', '') in allowed]
+        allowed = ALL_PAIRS
+        auto_trade_pairs = [p for p in pair_list if p in allowed]
         if not auto_trade_pairs:
-            auto_trade_pairs = ['USDJPY', 'GBPUSD']
+            auto_trade_pairs = ALL_PAIRS
     else:
-        auto_trade_pairs = ['USDJPY', 'GBPUSD']
+        auto_trade_pairs = ALL_PAIRS
     return jsonify({"pairs": auto_trade_pairs})
 
 @app.route('/api/update_trade', methods=['POST'])

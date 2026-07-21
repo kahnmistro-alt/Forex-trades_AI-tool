@@ -10,6 +10,9 @@ document.addEventListener('DOMContentLoaded', () => {
             const retrainBtn = document.getElementById('retrainBtn');
             const retrainStatus = document.getElementById('retrainStatus');
 
+            // All 10 major pairs
+            const ALL_PAIRS = 'EURUSD=X,GBPUSD=X,AUDUSD=X,USDCAD=X,USDCHF=X,EURGBP=X,EURJPY=X,NZDUSD=X,GBPJPY=X,USDJPY=X';
+
             if (autoTradeToggle) {
                 fetch('/api/auto_trade_status')
                     .then(res => res.json())
@@ -21,12 +24,11 @@ document.addEventListener('DOMContentLoaded', () => {
 
                 autoTradeToggle.addEventListener('change', () => {
                     const enabled = autoTradeToggle.checked;
-                    const fixedPairs = 'EURUSD=X, GBPUSD=X, USDJPY=X, AUDUSD=X, USDCAD=X';
                     if (enabled) {
                         fetch('/api/auto_trade_pairs', {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ pairs: fixedPairs })
+                            body: JSON.stringify({ pairs: ALL_PAIRS })
                         });
                     }
                     fetch('/api/auto_trade_status', {
@@ -72,9 +74,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 errorDiv.classList.add('hidden');
                 summaryDiv.innerHTML = '';
 
-                const pairs = 'EURUSD=X, GBPUSD=X, USDJPY=X, AUDUSD=X, USDCAD=X';
                 const payload = {
-                    pairs: pairs,
+                    pairs: ALL_PAIRS,
                     interval: '1h',
                     atr_period: 14,
                     risk_mult: 1.0
@@ -150,7 +151,6 @@ document.addEventListener('DOMContentLoaded', () => {
             row.insertCell(7).textContent = r.sl;
             row.insertCell(8).textContent = r.atr;
 
-            // Profit columns
             const profitCell = row.insertCell(9);
             profitCell.textContent = r.tp_profit !== undefined && r.tp_profit !== null ? r.tp_profit.toFixed(2) : '-';
             const lossCell = row.insertCell(10);

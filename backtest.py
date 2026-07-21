@@ -15,7 +15,11 @@ from candlestick_patterns import detect_candlestick_patterns, get_pattern_signal
 from chart_patterns import detect_chart_patterns
 
 # ---------- Configuration ----------
-PAIRS = ['EURUSD=X', 'GBPUSD=X', 'AUDUSD=X', 'USDCAD=X']
+PAIRS = [
+    'EURUSD=X', 'GBPUSD=X', 'AUDUSD=X', 'USDCAD=X',
+    'USDCHF=X', 'EURGBP=X', 'EURJPY=X', 'NZDUSD=X',
+    'GBPJPY=X', 'USDJPY=X'
+]
 START_DATE = '2020-01-01'
 END_DATE = '2025-07-16'
 INTERVAL = '1d'
@@ -32,24 +36,16 @@ INITIAL_TRAIN_BARS = 600
 TEST_BARS = 300
 STEP = 300
 
-# ---- Extended feature set ----
 FEATURES = [
-    # OHLC + lags
     'open', 'high', 'low', 'close',
     'open_prev_1', 'high_prev_1', 'low_prev_1', 'close_prev_1',
     'open_prev_2', 'high_prev_2', 'low_prev_2', 'close_prev_2',
-
-    # Standard indicators (existing)
     'rsi_14', 'macd', 'atr_14',
     'bb_upper', 'bb_middle', 'bb_lower', 'bb_width',
     'roc_10', 'roc_20',
     'returns_std_10', 'returns_skew_10', 'returns_kurt_10',
-
-    # ---- New momentum indicators ----
     'stoch_k', 'stoch_d', 'williams_r', 'cci_20', 'adx_14',
-
-    # ---- New volatility indicators ----
-    'volatility_20', 'volatility_ratio',
+    'volatility_20', 'volatility_ratio'
 ]
 
 # ---------- Data Fetch & Feature Engineering ----------
@@ -90,7 +86,6 @@ def add_features(df):
     if len(df) < 20:
         return pd.DataFrame()
     
-    # ---- Existing indicators ----
     df['rsi_14'] = ta.rsi(df['close'], length=14)
     macd_df = ta.macd(df['close'], fast=12, slow=26, signal=9)
     if macd_df is not None and not macd_df.empty:
@@ -112,8 +107,7 @@ def add_features(df):
     df['returns_skew_10'] = ret.rolling(10).skew()
     df['returns_kurt_10'] = ret.rolling(10).kurt()
 
-    # ---- New momentum indicators ----
-    # Stochastic
+    # New momentum
     stoch = ta.stoch(df['high'], df['low'], df['close'], k=14, d=3)
     if stoch is not None and not stoch.empty:
         df['stoch_k'] = stoch.get('STOCHk_14_3_3', np.nan)
@@ -121,26 +115,19 @@ def add_features(df):
     else:
         df['stoch_k'] = np.nan
         df['stoch_d'] = np.nan
-
-    # Williams %R
     df['williams_r'] = ta.willr(df['high'], df['low'], df['close'], length=14)
-
-    # CCI (20)
     df['cci_20'] = ta.cci(df['high'], df['low'], df['close'], length=20)
-
-    # ADX (14)
     adx = ta.adx(df['high'], df['low'], df['close'], length=14)
     if adx is not None and not adx.empty:
         df['adx_14'] = adx.get('ADX_14', np.nan)
     else:
         df['adx_14'] = np.nan
 
-    # ---- New volatility indicators ----
+    # New volatility
     df['volatility_20'] = ret.rolling(20).std()
     df['volatility_ratio'] = df['volatility_20'] / df['volatility_20'].rolling(10).mean()
     df['volatility_ratio'] = df['volatility_ratio'].replace([np.inf, -np.inf], np.nan)
 
-    # ---- Lags ----
     for lag in [1, 2]:
         df[f'open_prev_{lag}'] = df['open'].shift(lag)
         df[f'high_prev_{lag}'] = df['high'].shift(lag)
@@ -533,7 +520,7 @@ def run_multi_pairs(pairs, start, end, interval,
     return all_results
 
 if __name__ == '__main__':
-    print("==== COMPARING RULE-ONLY vs SVM+HMM (excluding USDJPY) ====")
+    print("==== COMPARING RULE-ONLY vs SVM+HMM (all 10 pairs) ====")
     print(f"Using {INTERVAL} data from {START_DATE} to {END_DATE}")
     print(f"Train: {INITIAL_TRAIN_BARS} bars, Test: {TEST_BARS} bars, Step: {STEP}")
     print(f"Parameters: risk_atr=1.0, min_confidence={MIN_CONFIDENCE}, reward_ratio=3.0")
