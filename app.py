@@ -1,3 +1,4 @@
+# app.py – CNN-only signal generation (no rule, no SVM/HMM)
 import os
 import json
 import time
@@ -11,8 +12,6 @@ import pandas as pd
 import numpy as np
 import pandas_ta as ta
 from dotenv import load_dotenv
-from candlestick_patterns import detect_candlestick_patterns, get_pattern_signal
-from chart_patterns import detect_chart_patterns
 from pattern_model import PatternModel
 import pandas_datareader.data as web
 import warnings
@@ -29,7 +28,7 @@ except ImportError as e:
 
 app = Flask(__name__)
 
-# ---------- Best parameters from backtest ----------
+# ---------- Parameters ----------
 RISK_ATR = 1.0
 MIN_CONFIDENCE = 0.7
 REWARD_RATIO = 3.0
@@ -150,7 +149,7 @@ auto_trade_thread = None
 auto_trade_lock = threading.Lock()
 auto_trade_pairs = AUTO_TRADE_PAIRS
 
-# ---------- ML Model ----------
+# ---------- ML Model (CNN only) ----------
 class SupabaseClientWrapper:
     def __init__(self, supabase_url, service_key):
         self.base_url = supabase_url
@@ -430,9 +429,6 @@ CREATE TABLE IF NOT EXISTS config (
 INSERT INTO config (key, value) VALUES ('min_confidence', 0.7)
 ON CONFLICT (key) DO NOTHING;
 
-INSERT INTO config (key, value) VALUES ('rule_weight', 0.3)
-ON CONFLICT (key) DO NOTHING;
-
 CREATE INDEX IF NOT EXISTS idx_trades_result ON trades(result);
 CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp);
         """)
@@ -463,16 +459,7 @@ def get_min_confidence():
 def update_min_confidence(new_val):
     supabase_request('PATCH', 'config?key=eq.min_confidence', {'value': new_val})
 
-def load_rule_weight():
-    global _rule_weight
-    ok, result = supabase_request('GET', 'config?key=eq.rule_weight')
-    if ok and result:
-        _rule_weight = result[0].get('value', 0.3)
-    else:
-        _rule_weight = 0.3
-    print(f"Loaded rule_weight: {_rule_weight:.2f}")
-
-def log_trade(pair, signal, price, tp, sl, result, pnl, source='hybrid', ml_conf=0.0, rule_conf=0.0):
+def log_trade(pair, signal, price, tp, sl, result, pnl, source='cnn', ml_conf=0.0, rule_conf=0.0):
     data = {
         'pair': pair,
         'signal': signal,
@@ -511,50 +498,11 @@ def update_confidence_threshold():
     except Exception as e:
         print(f"Error updating confidence threshold: {e}")
 
-# ---------- Dynamic Fusion Weight ----------
-_rule_weight = 0.3
-_rule_weight_lock = threading.Lock()
-_RULE_WEIGHT_UPDATE_INTERVAL = 3600  # 1 hour
-
-def update_rule_weight():
-    """Adjust rule_weight based on recent performance of ML vs rule signals."""
-    global _rule_weight
-    try:
-        ok, trades = supabase_request('GET', 'trades?limit=50&order=timestamp.desc')
-        if not ok or len(trades) < 20:
-            return
-        ml_trades = [t for t in trades if t.get('source') == 'ml' and t['result'] != 'pending']
-        rule_trades = [t for t in trades if t.get('source') == 'rule' and t['result'] != 'pending']
-        if len(ml_trades) < 10 or len(rule_trades) < 10:
-            return
-        ml_wr = sum(1 for t in ml_trades if t['result'] == 'win') / len(ml_trades)
-        rule_wr = sum(1 for t in rule_trades if t['result'] == 'win') / len(rule_trades)
-        with _rule_weight_lock:
-            if rule_wr > ml_wr:
-                _rule_weight = min(1.0, _rule_weight + 0.05)
-            elif ml_wr > rule_wr:
-                _rule_weight = max(0.0, _rule_weight - 0.05)
-            supabase_request('PATCH', 'config?key=eq.rule_weight', {'value': _rule_weight})
-        print(f"Updated rule_weight: {_rule_weight:.2f} (ML WR: {ml_wr:.2f}, Rule WR: {rule_wr:.2f})")
-    except Exception as e:
-        print(f"Error updating rule_weight: {e}")
-
-def rule_weight_update_loop():
-    while True:
-        time.sleep(_RULE_WEIGHT_UPDATE_INTERVAL)
-        update_rule_weight()
-
-def start_rule_weight_thread():
-    thread = threading.Thread(target=rule_weight_update_loop, daemon=True)
-    thread.start()
-    print("🚀 Rule‑weight update thread started.")
-
 # ---------- Macro Data Cache ----------
 _macro_cache = {}
 _macro_lock = threading.Lock()
 
 def fetch_macro_data(start_date, end_date):
-    """Fetch bond yields and VIX from FRED and Yahoo, compute spreads."""
     global _macro_cache
     with _macro_lock:
         cache_key = f"{start_date}_{end_date}"
@@ -563,16 +511,15 @@ def fetch_macro_data(start_date, end_date):
             return _macro_cache[cache_key]
         try:
             print("📊 Fetching macro data (yields & VIX)...")
-            # FRED series codes for 10-year yields
             fred_symbols = {
                 'us10y': 'DGS10',
-                'de10y': 'IRLTLT01DEM156N',  # Germany
-                'uk10y': 'IRLTLT01GBM156N',  # UK
-                'au10y': 'IRLTLT01AUM156N',  # Australia
-                'ca10y': 'IRLTLT01CAM156N',  # Canada
-                'ch10y': 'IRLTLT01CHM156N',  # Switzerland
-                'nz10y': 'IRLTLT01NZM156N',  # New Zealand
-                'jp10y': 'IRLTLT01JPM156N',  # Japan
+                'de10y': 'IRLTLT01DEM156N',
+                'uk10y': 'IRLTLT01GBM156N',
+                'au10y': 'IRLTLT01AUM156N',
+                'ca10y': 'IRLTLT01CAM156N',
+                'ch10y': 'IRLTLT01CHM156N',
+                'nz10y': 'IRLTLT01NZM156N',
+                'jp10y': 'IRLTLT01JPM156N',
             }
             combined = pd.DataFrame()
             for name, fred_code in fred_symbols.items():
@@ -585,18 +532,12 @@ def fetch_macro_data(start_date, end_date):
                         combined = combined.join(data, how='outer')
                 except Exception as e:
                     print(f"⚠️ Could not fetch {name} ({fred_code}): {e}")
-                    # Add NaN column
                     combined[name] = np.nan
 
-            # Fetch VIX from Yahoo
             vix_data = yf.download('^VIX', start=start_date, end=end_date, progress=False, timeout=60)
             if not vix_data.empty:
                 vix_series = vix_data['Adj Close'] if 'Adj Close' in vix_data.columns else vix_data['Close']
                 if isinstance(vix_series, pd.DataFrame):
-                    # yfinance can return MultiIndex columns even for a single
-                    # ticker, turning this selection into a 1-column DataFrame
-                    # instead of a Series — silently breaking the 'vix' name
-                    # assignment/join below and leaving the column all-NaN.
                     vix_series = vix_series.iloc[:, 0]
                 vix_series.name = 'vix'
                 if combined.empty:
@@ -608,16 +549,13 @@ def fetch_macro_data(start_date, end_date):
                 print("⚠️ No macro data fetched.")
                 return pd.DataFrame()
 
-            # Ensure all required columns exist
             required_cols = ['us10y', 'de10y', 'uk10y', 'au10y', 'ca10y', 'ch10y', 'nz10y', 'jp10y', 'vix']
             for col in required_cols:
                 if col not in combined.columns:
                     combined[col] = np.nan
 
-            # Forward fill (daily yields are often missing on weekends)
             combined = combined.ffill().bfill()
 
-            # Compute spreads (all spreads use the latest available yields)
             combined['spread_us_de'] = combined['us10y'] - combined['de10y']
             combined['spread_us_uk'] = combined['us10y'] - combined['uk10y']
             combined['spread_us_au'] = combined['us10y'] - combined['au10y']
@@ -629,7 +567,6 @@ def fetch_macro_data(start_date, end_date):
             combined['spread_uk_jp'] = combined['uk10y'] - combined['jp10y']
             combined['spread_us_jp'] = combined['us10y'] - combined['jp10y']
 
-            # Drop rows where all spreads are NaN
             spread_cols = [col for col in combined.columns if col.startswith('spread_')]
             combined = combined.dropna(subset=spread_cols, how='all')
 
@@ -638,7 +575,6 @@ def fetch_macro_data(start_date, end_date):
             return combined
         except Exception as e:
             print(f"❌ Error fetching macro data: {e}")
-            import traceback
             traceback.print_exc()
             return pd.DataFrame()
 
@@ -647,7 +583,6 @@ _commodity_cache = {}
 _commodity_lock = threading.Lock()
 
 def fetch_commodity_data(start_date, end_date):
-    """Fetch commodity prices with fallback."""
     global _commodity_cache
     with _commodity_lock:
         cache_key = f"{start_date}_{end_date}"
@@ -683,11 +618,10 @@ def fetch_commodity_data(start_date, end_date):
             return combined
         except Exception as e:
             print(f"❌ Error fetching commodity data: {e}")
-            import traceback
             traceback.print_exc()
             return pd.DataFrame()
 
-# ---------- Pattern Recognition ----------
+# ---------- Data Fetching ----------
 def get_date_ranges():
     now = datetime.now()
     recent_end = now.strftime("%Y-%m-%d")
@@ -735,104 +669,36 @@ def fetch_data(pair, start, end, interval):
             return data
     except Exception as e:
         print(f"❌ {pair} daily fallback error: {e}")
-    try:
-        print(f"📊 {pair}: trying with period='1mo'...")
-        data = yf.download(
-            pair,
-            period='1mo',
-            interval='1h',
-            progress=False,
-            timeout=60
-        )
-        if not data.empty:
-            print(f"✅ {pair}: {len(data)} bars (period='1mo')")
-            if 'Adj Close' in data.columns:
-                data = data.drop(columns=['Adj Close'])
-            data.columns = ['open', 'high', 'low', 'close', 'volume']
-            return data
-    except Exception as e:
-        print(f"❌ {pair} period fallback error: {e}")
     print(f"❌ No data for {pair} after all attempts.")
     return pd.DataFrame()
 
-def detect_support_resistance(df, window=20):
-    try:
-        high = df['high']
-        low = df['low']
-        piv_high = high[(high.shift(1) < high) & (high.shift(-1) < high)]
-        piv_low = low[(low.shift(1) > low) & (low.shift(-1) > low)]
-        if len(piv_high) == 0 or len(piv_low) == 0:
-            return None, None
-        current = df['close'].iloc[-1]
-        support = piv_low[piv_low < current].max() if any(piv_low < current) else None
-        resistance = piv_high[piv_high > current].min() if any(piv_high > current) else None
-        return support, resistance
-    except:
-        return None, None
-
-def detect_trend(df, ma_short=20, ma_long=50):
-    try:
-        if len(df) < ma_long:
-            return 'neutral'
-        sma_short = df['close'].rolling(ma_short).mean().iloc[-1]
-        sma_long = df['close'].rolling(ma_long).mean().iloc[-1]
-        short_slope = df['close'].rolling(ma_short).mean().diff(5).iloc[-1]
-        if sma_short > sma_long and short_slope > 0:
-            return 'uptrend'
-        elif sma_short < sma_long and short_slope < 0:
-            return 'downtrend'
-        else:
-            return 'neutral'
-    except:
-        return 'neutral'
-
-def detect_breakout(df, lookback=20, threshold=0.002):
-    try:
-        high = df['high'].iloc[-lookback:-1].max()
-        low = df['low'].iloc[-lookback:-1].min()
-        curr_close = df['close'].iloc[-1]
-        if curr_close > high * (1 + threshold):
-            return 'breakout_up'
-        elif curr_close < low * (1 - threshold):
-            return 'breakout_down'
-        else:
-            return None
-    except:
-        return None
-
 # ---------- Profit Calculation Helpers ----------
 def get_pip_value(pair, volume=1.0):
-    """Return dollars per pip for a given pair and volume (standard lot = 1.0)."""
     global pytrader, pytrader_connected
     if pytrader_connected and pair in pytrader.instrument_conversion_list:
         info = pytrader.Get_instrument_info(pair)
         if info:
             tick_size = info.get('tick_size')
-            tick_value = info.get('tick_value')  # per standard lot
+            tick_value = info.get('tick_value')
             if tick_size and tick_value:
-                # dollars per point * volume
                 return tick_value / tick_size * volume
-    # Fallback approximations
     if pair.endswith('JPY'):
         pip_size = 0.01
     else:
         pip_size = 0.0001
-    # Standard lot (1.0) = $10 per pip, so dollars per pip = 10 * volume
     return 10.0 * volume
 
 def compute_profit(entry, exit_price, pair, volume):
-    """Return dollar profit/loss for a trade from entry to exit."""
     global pytrader, pytrader_connected
     if pytrader_connected and pair in pytrader.instrument_conversion_list:
         info = pytrader.Get_instrument_info(pair)
         if info:
             tick_size = info.get('tick_size')
-            tick_value = info.get('tick_value')  # per standard lot
+            tick_value = info.get('tick_value')
             if tick_size and tick_value:
                 diff = exit_price - entry
                 profit = (diff / tick_size) * tick_value * volume
                 return profit
-    # Fallback
     if pair.endswith('JPY'):
         pip_size = 0.01
     else:
@@ -853,30 +719,23 @@ _RETRAIN_PAIRS = [
 ]
 
 def retrain_model():
-    """Fetch fresh data from the start of the year and retrain the SVM+HMM model."""
     with _retraining_lock:
-        print("🔄 Starting model retraining...")
+        print("🔄 Starting model retraining (CNN only)...")
         try:
             all_dfs = []
             now = datetime.now()
             start_of_year = datetime(now.year, 1, 1)
 
-            # Fetch macro and commodity data once
             macro_df = fetch_macro_data(start_of_year.strftime('%Y-%m-%d'), now.strftime('%Y-%m-%d'))
             commodity_df = fetch_commodity_data(start_of_year.strftime('%Y-%m-%d'), now.strftime('%Y-%m-%d'))
 
             for pair in _RETRAIN_PAIRS:
                 df = fetch_data(pair, start_of_year.strftime('%Y-%m-%d'), now.strftime('%Y-%m-%d'), '1h')
                 if not df.empty:
-                    # Reset index and rename whatever the index column ended up being
-                    # (yfinance calls it 'Date' for daily bars, 'Datetime' for intraday
-                    # bars, and sometimes just 'index' — rename by position so it works
-                    # regardless of interval).
                     df = df.reset_index()
                     df.rename(columns={df.columns[0]: 'Date'}, inplace=True)
                     df['Date'] = pd.to_datetime(df['Date'])
 
-                    # Merge macro data (spreads)
                     if not macro_df.empty:
                         macro_df.index = pd.to_datetime(macro_df.index)
                         df = df.merge(macro_df, left_on='Date', right_index=True, how='left')
@@ -884,7 +743,6 @@ def retrain_model():
                             if col in df.columns:
                                 df[col] = df[col].ffill()
 
-                    # Merge commodity data
                     if not commodity_df.empty:
                         commodity_df.index = pd.to_datetime(commodity_df.index)
                         df = df.merge(commodity_df, left_on='Date', right_index=True, how='left')
@@ -899,16 +757,14 @@ def retrain_model():
                 return False
 
             combined = pd.concat(all_dfs, ignore_index=True)
-            # Remove the 'Date' column as it's no longer needed
             if 'Date' in combined.columns:
                 combined = combined.drop(columns=['Date'])
-            # Also drop any 'index' column if present
             if 'index' in combined.columns:
                 combined = combined.drop(columns=['index'])
 
             success = pattern_model.train(combined)
             if success:
-                print("✅ Model retrained successfully.")
+                print("✅ CNN model retrained successfully.")
             else:
                 print("❌ Retraining failed.")
             return success
@@ -930,77 +786,7 @@ def start_auto_retrain_thread():
         _retraining_thread.start()
         print("🚀 Auto‑retrain thread started.")
 
-# ---------- Signal Computation (ML + Rule) ----------
-def compute_pattern_signal(df):
-    """
-    Returns (ml_signal, ml_conf, rule_signal, rule_conf, details)
-    """
-    # ML prediction
-    ml_signal, ml_conf = pattern_model.predict_pattern(df)
-
-    # ---- Rule-based (candlestick + chart patterns) ----
-    candle_patterns = detect_candlestick_patterns(df)
-    candle_signal, candle_conf = get_pattern_signal(candle_patterns)
-    chart_patterns = detect_chart_patterns(df, lookback=40) if len(df) >= 40 else []
-    support, resistance = detect_support_resistance(df)
-    trend = detect_trend(df)
-    breakout = detect_breakout(df)
-
-    rule_signal = 'HOLD'
-    rule_conf = 0.0
-
-    if candle_signal != 'HOLD':
-        rule_signal = candle_signal
-        rule_conf = candle_conf
-        for pat in chart_patterns:
-            if pat in ['double_bottom', 'inverse_head_shoulders', 'ascending_triangle'] and rule_signal == 'BUY':
-                rule_conf = min(1.0, rule_conf + 0.15)
-            elif pat in ['double_top', 'head_shoulders', 'descending_triangle'] and rule_signal == 'SELL':
-                rule_conf = min(1.0, rule_conf + 0.15)
-        if rule_signal == 'BUY' and trend == 'uptrend':
-            rule_conf = min(1.0, rule_conf + 0.1)
-        elif rule_signal == 'SELL' and trend == 'downtrend':
-            rule_conf = min(1.0, rule_conf + 0.1)
-    else:
-        if chart_patterns:
-            bullish_pats = ['double_bottom', 'inverse_head_shoulders', 'ascending_triangle', 'falling_wedge']
-            bearish_pats = ['double_top', 'head_shoulders', 'descending_triangle', 'rising_wedge']
-            bullish = sum(1 for p in chart_patterns if p in bullish_pats)
-            bearish = sum(1 for p in chart_patterns if p in bearish_pats)
-            if bullish > bearish:
-                rule_signal = 'BUY'
-                rule_conf = 0.5 + 0.3 * (bullish / (bullish + bearish + 1e-6))
-            elif bearish > bullish:
-                rule_signal = 'SELL'
-                rule_conf = 0.5 + 0.3 * (bearish / (bullish + bearish + 1e-6))
-            else:
-                rule_signal = 'HOLD'
-                rule_conf = 0.0
-            if rule_signal == 'BUY' and trend == 'uptrend':
-                rule_conf = min(1.0, rule_conf + 0.2)
-            elif rule_signal == 'SELL' and trend == 'downtrend':
-                rule_conf = min(1.0, rule_conf + 0.2)
-        else:
-            rule_signal = 'HOLD'
-            rule_conf = 0.0
-
-    # Trend filter for both
-    if rule_signal != 'HOLD':
-        if rule_signal == 'BUY' and trend == 'downtrend':
-            rule_signal = 'HOLD'
-            rule_conf = 0.0
-        elif rule_signal == 'SELL' and trend == 'uptrend':
-            rule_signal = 'HOLD'
-            rule_conf = 0.0
-
-    details = {
-        'trend': trend,
-        'support': support,
-        'resistance': resistance,
-        'breakout': breakout
-    }
-    return ml_signal, ml_conf, rule_signal, rule_conf, details
-
+# ---------- Signal Computation (CNN only) ----------
 def compute_tp_sl(price, atr, signal, risk_atr=RISK_ATR, reward_ratio=REWARD_RATIO):
     risk = atr * risk_atr
     if signal == 'BUY':
@@ -1019,29 +805,17 @@ def process_pair(pair, interval, atr_period, risk_mult, reward_ratio):
         if df.empty or len(df) < 60:
             return None
 
-        # Add macro and commodity features for live signals.
-        # NOTE: several of the FRED international bond-yield series are only
-        # published monthly, and even VIX/commodities can gap over weekends.
-        # A narrow window here reliably returns 0 rows for those series (they
-        # just never publish within the window), which then propagates as
-        # all-NaN feature columns into the model. Fetch a wide historical
-        # window instead — we only ever use the *latest* row (see below), so
-        # this just guarantees there's actually a recent data point to find,
-        # and it's cheap since fetch_macro_data/fetch_commodity_data cache by
-        # date-range key.
         macro_start = (datetime.now() - timedelta(days=400)).strftime('%Y-%m-%d')
         macro_end = datetime.now().strftime('%Y-%m-%d')
         macro_df = fetch_macro_data(macro_start, macro_end)
         commodity_df = fetch_commodity_data(macro_start, macro_end)
 
-        # Add latest macro spreads
         if not macro_df.empty:
             latest = macro_df.iloc[-1]
             for col in macro_df.columns:
                 df[col] = latest.get(col, np.nan)
             df = df.ffill()
 
-        # Add latest commodity prices
         if not commodity_df.empty:
             latest = commodity_df.iloc[-1]
             for col in ['crude_oil', 'gold', 'agri']:
@@ -1053,40 +827,23 @@ def process_pair(pair, interval, atr_period, risk_mult, reward_ratio):
         if df.empty:
             return None
 
-        # Get ML + rule signals
-        ml_signal, ml_conf, rule_signal, rule_conf, details = compute_pattern_signal(df)
-
-        # Fuse using dynamic weight
-        with _rule_weight_lock:
-            rw = _rule_weight
-        final_signal, final_conf = pattern_model.fuse_signals(ml_signal, ml_conf, rule_signal, rule_conf, rw)
-
-        # --- Enforce minimum confidence (0.7) ---
+        # CNN signal
+        signal, conf = pattern_model.predict_pattern(df)
         min_conf = get_min_confidence()
-        if final_conf < min_conf:
-            final_signal = 'HOLD'
-            final_conf = 0.0
 
-        # Determine source for logging
-        if final_signal == 'HOLD':
-            source = 'hold'
-        elif final_signal == ml_signal and final_signal != 'HOLD':
-            source = 'ml'
-        elif final_signal == rule_signal and final_signal != 'HOLD':
-            source = 'rule'
-        else:
-            source = 'hybrid'
+        if conf < min_conf:
+            signal = 'HOLD'
+            conf = 0.0
 
         current_atr = df['atr'].iloc[-1]
-        live_price, live_ok = get_live_entry_price(pair, final_signal)
+        live_price, live_ok = get_live_entry_price(pair, signal)
         if live_ok:
             reference_price = live_price
         else:
             reference_price = df['close'].iloc[-1]
 
-        # Compute TP/SL only if signal is not HOLD
-        if final_signal != 'HOLD':
-            raw_sl, raw_tp = compute_tp_sl(reference_price, current_atr, final_signal,
+        if signal != 'HOLD':
+            raw_sl, raw_tp = compute_tp_sl(reference_price, current_atr, signal,
                                            risk_atr=risk_mult, reward_ratio=reward_ratio)
             adjusted_sl, adjusted_tp = adjust_sl_tp(pair, reference_price, raw_sl, raw_tp)
             if adjusted_sl is None or adjusted_tp is None:
@@ -1101,11 +858,10 @@ def process_pair(pair, interval, atr_period, risk_mult, reward_ratio):
             reason = "No signal"
             sl, tp = None, None
 
-        # Profit calculation
         volume_for_profit = TRADE_VOLUME
         tp_profit = None
         sl_loss = None
-        if final_signal != 'HOLD' and can_trade and sl is not None and tp is not None:
+        if signal != 'HOLD' and can_trade and sl is not None and tp is not None:
             tp_profit = compute_profit(reference_price, tp, pair, volume_for_profit)
             sl_loss = compute_profit(reference_price, sl, pair, volume_for_profit)
 
@@ -1115,28 +871,26 @@ def process_pair(pair, interval, atr_period, risk_mult, reward_ratio):
             "signal_point": {
                 "date": str(df.index[-1]),
                 "price": reference_price,
-                "signal": final_signal
-            } if final_signal != "HOLD" else None
+                "signal": signal
+            } if signal != "HOLD" else None
         }
 
         return {
             "pair": pair.replace("=X", ""),
-            "signal": final_signal,
-            "confidence": round(final_conf, 3) if final_signal != 'HOLD' else 0.0,
+            "signal": signal,
+            "confidence": round(conf, 3) if signal != 'HOLD' else 0.0,
             "price": round(reference_price, 5),
             "tp": round(tp, 5) if tp is not None else None,
             "sl": round(sl, 5) if sl is not None else None,
             "atr": round(current_atr, 5),
             "can_trade": can_trade,
             "can_trade_reason": reason,
-            "pattern_details": details,
-            "trend": details['trend'],
             "chart": chart_data,
             "tp_profit": round(tp_profit, 2) if tp_profit is not None else None,
             "sl_loss": round(sl_loss, 2) if sl_loss is not None else None,
-            "source": source,
-            "ml_conf": round(ml_conf, 3),
-            "rule_conf": round(rule_conf, 3),
+            "source": "cnn",
+            "ml_conf": round(conf, 3),
+            "rule_conf": 0.0,
             "error": None
         }
     except Exception as e:
@@ -1177,7 +931,7 @@ def execute_trade(pair, signal, price, tp, sl, volume=TRADE_VOLUME):
             magicnumber=0,
             stoploss=adjusted_sl,
             takeprofit=adjusted_tp,
-            comment="Pattern",
+            comment="CNN",
             market=False
         )
         if ticket == -1:
@@ -1218,9 +972,9 @@ def auto_trade_iteration():
                 log_trade(
                     res['pair'], res['signal'], res['price'],
                     res['tp'], res['sl'], 'pending', 0.0,
-                    source=res.get('source', 'hybrid'),
+                    source='cnn',
                     ml_conf=res.get('ml_conf', 0.0),
-                    rule_conf=res.get('rule_conf', 0.0)
+                    rule_conf=0.0
                 )
                 print(f"[Auto-Trade] ✅ {res['signal']} {res['pair']} executed")
             else:
@@ -1292,9 +1046,9 @@ def auto_trade():
                     log_trade(
                         res['pair'], res['signal'], res['price'],
                         res['tp'], res['sl'], 'pending', 0.0,
-                        source=res.get('source', 'hybrid'),
+                        source='cnn',
                         ml_conf=res.get('ml_conf', 0.0),
-                        rule_conf=res.get('rule_conf', 0.0)
+                        rule_conf=0.0
                     )
             else:
                 res['trade'] = {"success": False, "error": "No valid signal or invalid SL/TP"}
@@ -1346,7 +1100,6 @@ def update_trade():
 
 @app.route('/api/retrain', methods=['POST'])
 def retrain_endpoint():
-    """Manually trigger model retraining."""
     try:
         success = retrain_model()
         return jsonify({'success': success, 'message': 'Retraining completed' if success else 'Retraining failed'})
@@ -1357,6 +1110,7 @@ def retrain_endpoint():
 if __name__ == '__main__':
     init_db()
     print(f"✅ Database ready. Min confidence: {get_min_confidence()}")
+    print("🔧 Signal mode: CNN-LSTM hybrid (no rule, no SVM/HMM)")
     if PYTRADER_AVAILABLE:
         connect_to_mt4()
     if TWELVE_DATA_API_KEY:
@@ -1373,10 +1127,6 @@ if __name__ == '__main__':
         print(f"✅ yfinance works: fetched {len(test_data)} bars for {test_pair}")
     else:
         print(f"❌ yfinance failed for {test_pair}. Check internet connection and package.")
-    # Load rule_weight from DB
-    load_rule_weight()
-    # Start background threads
     start_auto_retrain_thread()
-    start_rule_weight_thread()
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)

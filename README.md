@@ -1,40 +1,75 @@
-Pattern Trader – AI-Powered Forex Signal System
-An advanced, self‑improving Forex trading system that uses per‑pair machine learning models (XGBoost, Random Forest, SVM+HMM) to generate high‑confidence signals. Built with Flask, Supabase, and yfinance, it automatically retrains models weekly and supports live execution via MetaTrader (PyTrader).
+Pattern Trader – CNN-LSTM Forex Signal System
+A production‑ready forex trading signal system powered by a hybrid CNN‑LSTM deep learning model.
+The system detects chart patterns, generates trade signals (BUY/SELL/HOLD) with confidence scores, and supports automated execution via MetaTrader 4/5.
 
-🚀 Features
-Pair‑specific models – each currency pair gets its own best‑performing ML model (XGBoost, RF, SVM+HMM, or rule‑based).
+Overview
+This system is designed to be a complete pipeline for algorithmic forex trading. It:
 
-Automatic retraining – models are retrained every 7 days with fresh data, stored in Supabase.
+Ingests real‑time OHLCV data from yfinance or Twelve Data.
 
-Manual retrain – one‑click retraining from the web GUI.
+Engineers a rich set of technical, macro‑economic, and commodity features.
 
-Live price feeds – uses Twelve Data API (with fallback to yfinance and PyTrader).
+Uses a CNN‑LSTM neural network to capture both geometric chart patterns (head & shoulders, triangles, flags) and temporal dependencies (price momentum, reversal sequences).
 
-Execution – integrates with MetaTrader via PyTrader (optional).
+Applies confidence calibration (Platt scaling) to produce probabilities in the range of 0.7–0.9.
 
-Web UI – clean dashboard to view signals, trade, copy trade plans, and toggle auto‑trading.
+Outputs actionable signals with stop‑loss and take‑profit levels based on volatility.
 
-Backtested – rigorously tested on 2022–2025 data; best models selected per pair.
+Logs all trades to Supabase for performance monitoring and adaptive retraining.
 
-📊 Backtest Results (2022–2025, daily data)
-Pair	Best Model	Win Rate	Total PnL	Val. Accuracy
-AUDUSD	Rule	33.3%	+5.92%	–
-EURUSD	XGBoost	42.9%	+6.86%	0.56
-GBPUSD	Random Forest	57.1%	+10.82%	0.58
-USDCAD	XGBoost	44.4%	+5.53%	0.47
-Conclusion: One‑size‑fits‑all fails. Pair‑tailored models significantly improve performance.
+Provides a web dashboard for monitoring signals, confidence, and trade history.
 
-🛠️ Tech Stack
-Backend: Flask, Python 3.13
+Note: This version uses only the CNN‑LSTM model. All fallback systems (SVM, HMM, rule‑based candlestick/chart pattern recognisers) have been removed. The system relies entirely on deep learning for signal generation.
 
-Data: yfinance, pandas, pandas_ta
+Features
+✅ CNN‑LSTM hybrid model – detects both spatial and temporal patterns in forex data.
 
-ML: scikit‑learn, XGBoost, hmmlearn
+✅ Real‑time data ingestion – OHLCV from yfinance or Twelve Data.
 
-Database: Supabase (PostgreSQL) – stores models and trade logs
+✅ Feature engineering – 30+ technical indicators + macro (bond spreads, VIX) + commodities.
 
-Price Feeds: Twelve Data API (primary), yfinance (fallback)
+✅ Confidence calibration – Platt scaling for reliable probability estimates.
 
-Execution: PyTrader (MT4/MT5 integration) – optional
+✅ Automated trade execution – integrated with MT4/MT5 via PyTrader.
 
-Deployment: Render (or any WSGI server)
+✅ Trade logging & performance tracking – Supabase database.
+
+✅ Periodic retraining – model updates every 6 hours with fresh data.
+
+✅ Web dashboard – built with Flask, JavaScript, and CSS.
+
+✅ Backtesting framework – walk‑forward validation to compare strategies.
+
+Architecture
+text
+┌─────────────────────┐
+│   Data Ingestion    │
+│ (yfinance / Twelve) │
+└─────────┬───────────┘
+          ▼
+┌─────────────────────┐
+│  Feature Engineering │
+│  (pandas_ta + macro) │
+└─────────┬───────────┘
+          ▼
+┌─────────────────────┐
+│   CNN‑LSTM Model    │
+│  (TensorFlow/Keras) │
+└─────────┬───────────┘
+          ▼
+┌─────────────────────┐
+│  Confidence         │
+│  Calibration        │
+└─────────┬───────────┘
+          ▼
+┌─────────────────────┐
+│  Signal Decision    │
+│  (BUY/SELL/HOLD)    │
+└─────────┬───────────┘
+          ▼
+┌─────────────────────┐
+│  Execution Layer    │
+│  (MT4/MT5 via       │
+│   PyTrader)         │
+└─────────────────────┘
+The system is modular – each component can be modified or replaced independently.
