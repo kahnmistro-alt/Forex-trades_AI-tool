@@ -1,4 +1,4 @@
-# pattern_model.py – CNN+LSTM only (fixed joblib serialization)
+# pattern_model.py – Lightweight SVM+HMM hybrid
 import pickle
 import base64
 import numpy as np
@@ -8,15 +8,19 @@ from datetime import datetime
 import warnings
 import io
 import joblib
+from sklearn.svm import SVC
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from hmmlearn import hmm
 
 warnings.filterwarnings('ignore')
-
-from cnn_lstm_model import CNNLSTMClassifier
 
 class PatternModel:
     def __init__(self, supabase_client):
         self.supabase = supabase_client
-        self.cnn_lstm = None
+        self.svm = None
+        self.hmm = None
+        self.scaler = None
         self.feature_columns = [
             'open', 'high', 'low', 'close',
             'open_prev_1', 'high_prev_1', 'low_prev_1', 'close_prev_1',
@@ -43,52 +47,62 @@ class PatternModel:
                 .limit(1) \
                 .execute()
             if not resp.data:
-                print("ℹ️ No existing CNN model found. Will train on first data.")
+                print("ℹ️ No existing SVM+HMM model found. Will train on first data.")
                 return False
 
             blob_b64 = resp.data[0]['model_blob']
             blob = base64.b64decode(blob_b64)
             data = pickle.loads(blob)
 
-            if 'cnn_lstm' in data and data['cnn_lstm'] is not None:
-                cnn_data = data['cnn_lstm']
-                self.cnn_lstm = CNNLSTMClassifier.from_bytes(
-                    model_bytes=cnn_data['model_bytes'],
-                    scaler_bytes=cnn_data.get('scaler_bytes'),
-                    cal_bytes=cnn_data.get('cal_bytes')
-                )
-                print("✅ CNN+LSTM model loaded from Supabase.")
+            if 'svm' in data and data['svm'] is not None:
+                self.svm = joblib.load(io.BytesIO(data['svm']))
+                self.hmm = joblib.load(io.BytesIO(data['hmm']))
+                self.scaler = joblib.load(io.BytesIO(data['scaler']))
+                print("✅ SVM+HMM model loaded from Supabase.")
                 return True
             else:
-                print("ℹ️ No CNN+LSTM model found in saved data.")
-                self.cnn_lstm = None
+                print("ℹ️ No SVM+HMM model found in saved data.")
+                self.svm = None
+                self.hmm = None
+                self.scaler = None
                 return False
         except Exception as e:
-            print(f"⚠️ Failed to load CNN model: {e}. Will retrain.")
-            self.cnn_lstm = None
+            print(f"⚠️ Failed to load SVM+HMM model: {e}. Will retrain.")
+            self.svm = None
+            self.hmm = None
+            self.scaler = None
             return False
 
-    def save_model(self, cnn_model_bytes, cnn_scaler_bytes, cnn_cal_bytes=None):
+    def save_model(self, svm_bytes, hmm_bytes, scaler_bytes):
         try:
+            resp = self.supabase.table('pattern_models') \
+                .select('id') \
+                .order('created_at', desc=True) \
+                .limit(1) \
+                .execute()
+
             save_data = {
-                'cnn_lstm': {
-                    'model_bytes': cnn_model_bytes,
-                    'scaler_bytes': cnn_scaler_bytes,
-                    'cal_bytes': cnn_cal_bytes
-                }
-            }
-            blob = pickle.dumps(save_data)
-            blob_b64 = base64.b64encode(blob).decode('utf-8')
-            data = {
-                'model_blob': blob_b64,
+                'model_blob': base64.b64encode(pickle.dumps({
+                    'svm': svm_bytes,
+                    'hmm': hmm_bytes,
+                    'scaler': scaler_bytes
+                })).decode('utf-8'),
                 'created_at': datetime.now().isoformat(),
-                'version': '12.0'
+                'version': 'svm_hmm_1.0'
             }
-            self.supabase.table('pattern_models').insert(data)
-            print("✅ CNN+LSTM model saved to Supabase.")
+
+            if resp.data:
+                row_id = resp.data[0]['id']
+                self.supabase.table('pattern_models') \
+                    .eq('id', row_id) \
+                    .update(save_data)
+                print("✅ SVM+HMM model updated in Supabase.")
+            else:
+                self.supabase.table('pattern_models').insert(save_data)
+                print("✅ SVM+HMM model saved to Supabase.")
             return True
         except Exception as e:
-            print(f"❌ Failed to save CNN model: {e}")
+            print(f"❌ Failed to save SVM+HMM model: {e}")
             return False
 
     def prepare_features(self, df):
@@ -96,7 +110,7 @@ class PatternModel:
             return None, None, None, None
         df = df.copy()
 
-        # Technical indicators
+        # Technical indicators (same as before)
         df['rsi_14'] = ta.rsi(df['close'], length=14)
         macd_df = ta.macd(df['close'], fast=12, slow=26, signal=9)
         df['macd'] = macd_df['MACD_12_26_9'] if macd_df is not None else 0
@@ -138,108 +152,109 @@ class PatternModel:
             df[f'low_prev_{lag}'] = df['low'].shift(lag)
             df[f'close_prev_{lag}'] = df['close'].shift(lag)
 
-        # Macro/commodity columns (assumed already merged)
         for col in self.feature_columns:
             if col not in df.columns:
-                df[col] = np.nan
+                df[col] = 0.0
             else:
                 df[col] = df[col].ffill()
+        df[self.feature_columns] = df[self.feature_columns].fillna(0)
 
-        # Drop columns with >95% NaN
-        nan_frac = df[self.feature_columns].isna().mean()
-        bad_cols = nan_frac[nan_frac > 0.95]
-        if not bad_cols.empty:
-            print(f"⚠️ prepare_features: dropping unusable columns: {list(bad_cols.index)}")
-            df = df.drop(columns=list(bad_cols.index))
-
-        usable_features = [c for c in self.feature_columns if c in df.columns]
+        usable_features = self.feature_columns
         df_clean = df.dropna(subset=usable_features)
         if df_clean.empty:
-            print("⚠️ prepare_features: no rows left after dropping NaNs.")
             return None, None, None, None
 
         X = df_clean[usable_features].values
         idx = df_clean.index
         return X, df_clean, idx, usable_features
 
-    def create_sequences(self, df, feature_cols, window_size=60):
-        data = df[feature_cols].values
-        close = df['close'].values
-        X_seq, y_seq = [], []
-        for i in range(window_size, len(data)):
-            future_ret = close[i] / close[i-1] - 1
-            if abs(future_ret) <= 0.001:
-                continue
-            X_seq.append(data[i-window_size:i])
-            y_seq.append(1 if future_ret > 0 else 0)
-        if len(X_seq) == 0:
-            return None, None
-        return np.array(X_seq), np.array(y_seq)
-
-    def train(self, df, labels=None):
+    def train(self, df):
         X, df_clean, idx, usable_features = self.prepare_features(df)
         if X is None:
             return False
 
-        X_seq, y_seq = self.create_sequences(df_clean, usable_features, window_size=60)
-        if X_seq is None or len(X_seq) < 100:
-            print(f"Not enough sequences for CNN training: {len(X_seq) if X_seq is not None else 0}")
+        # Create labels: 1 for up (>0.1%), -1 for down (<-0.1%), 0 for neutral
+        future_ret = df_clean['close'].shift(-1) / df_clean['close'] - 1
+        y = np.where(future_ret > 0.001, 1, np.where(future_ret < -0.001, -1, 0))
+        # Use only non-neutral for binary classification
+        mask = y != 0
+        X_bin = X[mask]
+        y_bin = (y[mask] > 0).astype(int)
+
+        if len(X_bin) < 50:
+            print(f"Not enough non‑neutral samples for SVM: {len(X_bin)}")
             return False
 
-        print(f"Training CNN+LSTM with {len(X_seq)} sequences...")
-        model = CNNLSTMClassifier(window_size=60, n_features=len(usable_features),
-                                  epochs=30, batch_size=64, calibration=None)
-        model.fit(X_seq, y_seq)
+        # Scale features
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X_bin)
 
-        # Serialize using joblib with BytesIO
-        model_bytes = model.get_model_bytes()
+        # Train SVM
+        svm = SVC(kernel='rbf', C=1.0, gamma='scale', probability=True, random_state=42)
+        svm.fit(X_scaled, y_bin)
+
+        # Train HMM on all data (including neutral) for regime detection
+        X_all_scaled = scaler.transform(X)
+        hmm_model = hmm.GaussianHMM(n_components=3, covariance_type='full', n_iter=100, random_state=42)
+        hmm_model.fit(X_all_scaled)
+
+        # Serialize
+        svm_bytes = io.BytesIO()
+        joblib.dump(svm, svm_bytes)
+        svm_bytes = svm_bytes.getvalue()
+
+        hmm_bytes = io.BytesIO()
+        joblib.dump(hmm_model, hmm_bytes)
+        hmm_bytes = hmm_bytes.getvalue()
+
         scaler_bytes = io.BytesIO()
-        joblib.dump(model.scaler, scaler_bytes)
+        joblib.dump(scaler, scaler_bytes)
         scaler_bytes = scaler_bytes.getvalue()
 
-        cal_bytes = None
-        if model.calibrated_model is not None:
-            cal_buffer = io.BytesIO()
-            joblib.dump(model.calibrated_model, cal_buffer)
-            cal_bytes = cal_buffer.getvalue()
-
-        self.cnn_lstm = model
-        self.save_model(model_bytes, scaler_bytes, cal_bytes)
+        self.svm = svm
+        self.hmm = hmm_model
+        self.scaler = scaler
+        self.save_model(svm_bytes, hmm_bytes, scaler_bytes)
         return True
 
     def predict_pattern(self, df):
-        if self.cnn_lstm is None:
+        if self.svm is None or self.hmm is None or self.scaler is None:
             return 'HOLD', 0.0
 
         X, df_clean, idx, usable_features = self.prepare_features(df)
-        if X is None or len(df_clean) < 60:
+        if X is None or len(df_clean) < 20:
             return 'HOLD', 0.0
 
-        last_window = self._get_last_window(df_clean, usable_features, window_size=60)
-        if last_window is None:
-            return 'HOLD', 0.0
+        # Use the latest row's features
+        last_row = X[-1:].reshape(1, -1)
+        X_scaled = self.scaler.transform(last_row)
 
-        try:
-            prob = self.cnn_lstm.predict_proba(last_window)[0]
-            up_prob = prob[1]
-            if up_prob > 0.5:
-                signal = 'BUY'
-                conf = up_prob
+        # SVM prediction
+        prob = self.svm.predict_proba(X_scaled)[0]
+        pred = self.svm.predict(X_scaled)[0]
+        # Confidence from SVM probability of the predicted class
+        svm_conf = prob[1] if pred == 1 else prob[0]
+
+        # HMM regime
+        state_probs = self.hmm.predict_proba(X_scaled)[0]
+        dominant_state = np.argmax(state_probs)
+
+        # Adjust confidence based on regime (as in backtest.py)
+        # Assuming state 0 = bearish, 1 = neutral, 2 = bullish (can be inferred)
+        if pred == 1:  # BUY
+            if dominant_state == 2:   # bullish regime
+                conf = min(1.0, svm_conf + 0.15)
+            elif dominant_state == 0: # bearish regime
+                conf = max(0.0, svm_conf - 0.15)
             else:
-                signal = 'SELL'
-                conf = 1 - up_prob
-            return signal, float(conf)
-        except Exception as e:
-            print(f"⚠️ CNN prediction error: {e}")
-            return 'HOLD', 0.0
+                conf = svm_conf
+        else:  # SELL
+            if dominant_state == 0:   # bearish regime
+                conf = min(1.0, svm_conf + 0.15)
+            elif dominant_state == 2: # bullish regime
+                conf = max(0.0, svm_conf - 0.15)
+            else:
+                conf = svm_conf
 
-    def _get_last_window(self, df, feature_cols, window_size=60):
-        if len(df) < window_size:
-            return None
-        for col in feature_cols:
-            if col not in df.columns:
-                return None
-        window_df = df[feature_cols].iloc[-window_size:].values
-        if np.isnan(window_df).any():
-            return None
-        return window_df.reshape(1, window_size, len(feature_cols))
+        signal = 'BUY' if pred == 1 else 'SELL'
+        return signal, float(conf)

@@ -10,9 +10,6 @@ xgboost
 hmmlearn
 scipy
 gunicorn
-xgboost
 imbalanced-learn
 pandas-datareader
-tensorflow
 joblib
-scipy

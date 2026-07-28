@@ -1,230 +1,246 @@
-document.addEventListener('DOMContentLoaded', () => {
-            const refreshBtn = document.getElementById('refreshBtn');
-            const loadingDiv = document.getElementById('loading');
-            const errorDiv = document.getElementById('errorMsg');
-            const summaryDiv = document.getElementById('summary');
+// static/script.js
 
-            const autoTradeToggle = document.getElementById('autoTradeToggle');
-            const autoTradeStatus = document.getElementById('autoTradeStatus');
+// ---------- DOM refs ----------
+const refreshBtn = document.getElementById('refreshBtn');
+const autoTradeToggle = document.getElementById('autoTradeToggle');
+const autoTradeStatus = document.getElementById('autoTradeStatus');
+const retrainBtn = document.getElementById('retrainBtn');
+const retrainStatus = document.getElementById('retrainStatus');
+const loading = document.getElementById('loading');
+const errorMsg = document.getElementById('errorMsg');
+const summary = document.getElementById('summary');
 
-            const retrainBtn = document.getElementById('retrainBtn');
-            const retrainStatus = document.getElementById('retrainStatus');
+// ---------- Utilities ----------
+function showLoading(show) {
+    loading.classList.toggle('hidden', !show);
+}
 
-            // All 10 major pairs
-            const ALL_PAIRS = 'EURUSD=X,GBPUSD=X,AUDUSD=X,USDCAD=X,USDCHF=X,EURGBP=X,EURJPY=X,NZDUSD=X,GBPJPY=X,USDJPY=X';
-
-            if (autoTradeToggle) {
-                fetch('/api/auto_trade_status')
-                    .then(res => res.json())
-                    .then(data => {
-                        autoTradeToggle.checked = data.enabled;
-                        autoTradeStatus.textContent = data.enabled ? 'Enabled (60s)' : 'Disabled';
-                        autoTradeStatus.style.color = data.enabled ? '#10b981' : 'var(--text-secondary)';
-                    });
-
-                autoTradeToggle.addEventListener('change', () => {
-                    const enabled = autoTradeToggle.checked;
-                    if (enabled) {
-                        fetch('/api/auto_trade_pairs', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ pairs: ALL_PAIRS })
-                        });
-                    }
-                    fetch('/api/auto_trade_status', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ enabled: enabled })
-                        })
-                        .then(res => res.json())
-                        .then(data => {
-                            autoTradeStatus.textContent = data.enabled ? 'Enabled (60s)' : 'Disabled';
-                            autoTradeStatus.style.color = data.enabled ? '#10b981' : 'var(--text-secondary)';
-                        });
-                });
-            }
-
-            if (retrainBtn) {
-                retrainBtn.addEventListener('click', async() => {
-                    retrainBtn.disabled = true;
-                    retrainStatus.textContent = 'Retraining...';
-                    try {
-                        const resp = await fetch('/api/retrain', { method: 'POST' });
-                        const data = await resp.json();
-                        retrainStatus.textContent = data.success ? '✅ Done' : '❌ Failed';
-                    } catch (e) {
-                        retrainStatus.textContent = '⚠️ Error';
-                    } finally {
-                        retrainBtn.disabled = false;
-                        setTimeout(() => { retrainStatus.textContent = ''; }, 5000);
-                    }
-                });
-            }
-
-            function updateServerTime() {
-                document.getElementById('serverTime').innerHTML = `<i class="far fa-clock"></i> ${new Date().toLocaleString()}`;
-            }
-            updateServerTime();
-            setInterval(updateServerTime, 1000);
-
-            refreshBtn.addEventListener('click', refreshSignals);
-
-            async function refreshSignals() {
-                loadingDiv.classList.remove('hidden');
-                errorDiv.classList.add('hidden');
-                summaryDiv.innerHTML = '';
-
-                const payload = {
-                    pairs: ALL_PAIRS,
-                    interval: '1h',
-                    atr_period: 14,
-                    risk_mult: 1.0
-                };
-
-                try {
-                    const response = await fetch('/api/signals', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(payload)
-                    });
-                    const results = await response.json();
-                    loadingDiv.classList.add('hidden');
-
-                    if (!results.length) {
-                        errorDiv.textContent = 'No data returned.';
-                        errorDiv.classList.remove('hidden');
-                        return;
-                    }
-
-                    const valid = results.filter(r => !r.error);
-                    const errors = results.filter(r => r.error);
-                    if (errors.length) {
-                        errorDiv.innerHTML = `<i class="fas fa-exclamation-triangle"></i> ${errors.map(e => `${e.pair}: ${e.error}`).join('; ')}`;
-                errorDiv.classList.remove('hidden');
-            }
-
-            renderSummary(valid);
-        } catch (err) {
-            loadingDiv.classList.add('hidden');
-            errorDiv.textContent = 'Network error: ' + err.message;
-            errorDiv.classList.remove('hidden');
-        }
+function showError(msg) {
+    if (msg) {
+        errorMsg.textContent = msg;
+        errorMsg.classList.remove('hidden');
+    } else {
+        errorMsg.classList.add('hidden');
     }
+}
 
-    function renderSummary(results) {
-        if (!results.length) return;
-        const title = document.createElement('h2');
-        title.innerHTML = '<i class="fas fa-table-list"></i> Live Signals';
-        summaryDiv.appendChild(title);
+function updateServerTime() {
+    const now = new Date();
+    document.getElementById('serverTime').textContent = now.toLocaleTimeString();
+}
+setInterval(updateServerTime, 1000);
+updateServerTime();
 
-        const table = document.createElement('table');
-        table.className = 'signal-table';
-        table.innerHTML = `
-            <thead>
-                <tr><th>Pair</th><th>Signal</th><th>Conf</th><th>Pattern(s)</th><th>Trend</th>
-                    <th>Price</th><th>TP</th><th>SL</th><th>ATR</th>
-                    <th>TP Profit $</th><th>SL Loss $</th>
-                    <th>Action</th><th>Trade</th></tr>
-            </thead>
-            <tbody></tbody>
-        `;
-        const tbody = table.querySelector('tbody');
-        results.forEach(r => {
-            const row = tbody.insertRow();
-            row.dataset.pair = r.pair;
-            row.dataset.signal = r.signal;
-            row.dataset.price = r.price;
-            row.dataset.tp = r.tp;
-            row.dataset.sl = r.sl;
-            row.dataset.canTrade = r.can_trade;
-
-            row.insertCell(0).textContent = r.pair;
-            const sigCell = row.insertCell(1);
-            sigCell.innerHTML = `<span class="signal-${r.signal}">${r.signal}</span>`;
-            row.insertCell(2).textContent = r.confidence;
-
-            const patterns = r.pattern_details ? Object.keys(r.pattern_details.candle_patterns || {}).join(', ') : 'None';
-            row.insertCell(3).textContent = patterns;
-            row.insertCell(4).textContent = r.trend || 'neutral';
-            row.insertCell(5).textContent = r.price;
-            row.insertCell(6).textContent = r.tp;
-            row.insertCell(7).textContent = r.sl;
-            row.insertCell(8).textContent = r.atr;
-
-            const profitCell = row.insertCell(9);
-            profitCell.textContent = r.tp_profit !== undefined && r.tp_profit !== null ? r.tp_profit.toFixed(2) : '-';
-            const lossCell = row.insertCell(10);
-            lossCell.textContent = r.sl_loss !== undefined && r.sl_loss !== null ? r.sl_loss.toFixed(2) : '-';
-
-            const copyCell = row.insertCell(11);
-            const copyBtn = document.createElement('button');
-            copyBtn.textContent = '📋 Copy';
-            copyBtn.className = 'copy-btn';
-            copyBtn.addEventListener('click', (e) => {
-                e.stopPropagation();
-                copyTradePlan(r);
-            });
-            copyCell.appendChild(copyBtn);
-
-            const tradeCell = row.insertCell(12);
-            if (r.signal !== 'HOLD') {
-                const tradeBtn = document.createElement('button');
-                tradeBtn.textContent = '🚀 Trade Now';
-                if (r.can_trade) {
-                    tradeBtn.className = 'trade-btn';
-                } else {
-                    tradeBtn.className = 'trade-btn trade-btn-disabled';
-                    tradeBtn.disabled = true;
-                    tradeBtn.title = r.can_trade_reason || 'Not valid';
-                }
-                tradeBtn.dataset.pair = r.pair;
-                tradeBtn.dataset.signal = r.signal;
-                tradeBtn.dataset.price = r.price;
-                tradeBtn.dataset.tp = r.tp;
-                tradeBtn.dataset.sl = r.sl;
-                tradeBtn.addEventListener('click', (e) => {
-                    e.stopPropagation();
-                    if (!tradeBtn.disabled) {
-                        tradeNow(r.pair, r.signal, r.price, r.tp, r.sl);
-                    }
-                });
-                tradeCell.appendChild(tradeBtn);
-            } else {
-                tradeCell.textContent = '—';
-            }
+// ---------- Fetch signals ----------
+async function fetchSignals() {
+    showLoading(true);
+    showError(null);
+    try {
+        const resp = await fetch('/api/signals', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                pairs: 'EURUSD=X,GBPUSD=X,AUDUSD=X,USDCAD=X,USDCHF=X,EURGBP=X,EURJPY=X,NZDUSD=X,GBPJPY=X,USDJPY=X',
+                interval: '1h',
+                atr_period: 14,
+                risk_mult: 1.0
+            })
         });
-        summaryDiv.appendChild(table);
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const data = await resp.json();
+        renderSignals(data);
+    } catch (err) {
+        showError('Failed to fetch signals: ' + err.message);
+    } finally {
+        showLoading(false);
+    }
+}
+
+// ---------- Render signals table ----------
+function renderSignals(signals) {
+    summary.innerHTML = '';
+    if (!signals || signals.length === 0) {
+        summary.innerHTML = '<p style="color: var(--text-secondary);">No signals returned.</p>';
+        return;
     }
 
-    async function tradeNow(pair, signal, price, tp, sl) {
-        const payload = {
-            pairs: pair + '=X',
-            interval: '1h',
-            atr_period: 14,
-            risk_mult: 1.0,
-            volume: 0.01
-        };
-        try {
-            const resp = await fetch('/api/autotrade', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload)
-            });
-            const result = await resp.json();
-            if (result[0]?.trade?.success) {
-                alert(`✅ ${result[0].trade.message}`);
-            } else {
-                alert(`❌ ${result[0]?.trade?.error || 'Failed'}`);
-            }
-        } catch (err) {
-            alert('❌ ' + err.message);
+    const table = document.createElement('table');
+    table.className = 'signal-table';
+    table.innerHTML = `
+        <thead>
+            <tr>
+                <th>Pair</th>
+                <th>Signal</th>
+                <th>Confidence</th>
+                <th>Price</th>
+                <th>TP</th>
+                <th>SL</th>
+                <th>ATR</th>
+                <th>Ready</th>
+                <th>Action</th>
+            </tr>
+        </thead>
+        <tbody></tbody>
+    `;
+    const tbody = table.querySelector('tbody');
+
+    signals.forEach(sig => {
+        const row = document.createElement('tr');
+
+        // Pair
+        const pairCell = document.createElement('td');
+        pairCell.textContent = sig.pair || 'N/A';
+        row.appendChild(pairCell);
+
+        // Signal badge
+        const signalCell = document.createElement('td');
+        const badge = document.createElement('span');
+        const sigText = sig.signal || 'HOLD';
+        badge.className = `signal-${sigText}`;
+        badge.textContent = sigText;
+        signalCell.appendChild(badge);
+        row.appendChild(signalCell);
+
+        // Confidence
+        const confCell = document.createElement('td');
+        confCell.textContent = sig.confidence ? (sig.confidence * 100).toFixed(1) + '%' : '0%';
+        row.appendChild(confCell);
+
+        // Price
+        const priceCell = document.createElement('td');
+        priceCell.textContent = sig.price ? sig.price.toFixed(5) : '—';
+        row.appendChild(priceCell);
+
+        // TP
+        const tpCell = document.createElement('td');
+        tpCell.textContent = sig.tp ? sig.tp.toFixed(5) : '—';
+        row.appendChild(tpCell);
+
+        // SL
+        const slCell = document.createElement('td');
+        slCell.textContent = sig.sl ? sig.sl.toFixed(5) : '—';
+        row.appendChild(slCell);
+
+        // ATR
+        const atrCell = document.createElement('td');
+        atrCell.textContent = sig.atr ? sig.atr.toFixed(5) : '—';
+        row.appendChild(atrCell);
+
+        // Trade Ready (new column)
+        const readyCell = document.createElement('td');
+        const isReady = sig.trade_ready === true;
+        const readyIcon = document.createElement('i');
+        readyIcon.className = `fas fa-${isReady ? 'check-circle' : 'times-circle'} ready-icon ${isReady ? 'true' : 'false'}`;
+        readyIcon.title = sig.trade_ready_reason || (isReady ? 'Ready' : 'Not ready');
+        readyCell.appendChild(readyIcon);
+        row.appendChild(readyCell);
+
+        // Action button
+        const actionCell = document.createElement('td');
+        const tradeBtn = document.createElement('button');
+        tradeBtn.textContent = 'Trade Now';
+        tradeBtn.className = 'trade-btn';
+
+        const canTrade = sig.signal !== 'HOLD' && sig.can_trade === true;
+        const ready = sig.trade_ready === true;
+
+        if (canTrade && ready) {
+            tradeBtn.style.background = '#10b981'; // green
+            tradeBtn.onclick = () => executeTrade(sig);
+        } else {
+            tradeBtn.style.background = '#6b7280'; // grey
+            tradeBtn.disabled = true;
+            let reason = sig.trade_ready_reason || 'Conditions not met';
+            if (!canTrade) reason = sig.can_trade_reason || 'Invalid SL/TP or no signal';
+            tradeBtn.title = reason;
         }
-    }
+        actionCell.appendChild(tradeBtn);
+        row.appendChild(actionCell);
 
-    function copyTradePlan(r) {
-        const text = `${r.signal} ${r.pair} at ${r.price}\nTP: ${r.tp}\nSL: ${r.sl}`;
-        navigator.clipboard.writeText(text);
-    }
+        tbody.appendChild(row);
+    });
 
-    window.tradeNow = tradeNow;
+    summary.appendChild(table);
+}
+
+// ---------- Execute trade (manual) ----------
+async function executeTrade(signalData) {
+    if (!confirm(`Execute ${signalData.signal} on ${signalData.pair} at ${signalData.price}?`)) return;
+    try {
+        const resp = await fetch('/api/autotrade', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                pairs: signalData.pair + '=X',
+                interval: '1h',
+                atr_period: 14,
+                risk_mult: 1.0,
+                volume: 0.01
+            })
+        });
+        const result = await resp.json();
+        // ✅ FIXED: no optional chaining
+        if (resp.ok && result[0] && result[0].trade && result[0].trade.success) {
+            alert(`✅ Trade executed! Order ID: ${result[0].trade.order_id}`);
+        } else {
+            let errorMsg = 'Unknown error';
+            if (result[0] && result[0].trade && result[0].trade.error) {
+                errorMsg = result[0].trade.error;
+            }
+            alert(`❌ Trade failed: ${errorMsg}`);
+        }
+    } catch (err) {
+        alert('Error executing trade: ' + err.message);
+    }
+}
+
+// ---------- Auto‑trade toggle ----------
+async function setAutoTrade(enabled) {
+    try {
+        const resp = await fetch('/api/auto_trade_status', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ enabled })
+        });
+        const data = await resp.json();
+        autoTradeStatus.textContent = data.enabled ? 'Enabled' : 'Disabled';
+    } catch (err) {
+        console.error('Auto‑trade toggle error:', err);
+    }
+}
+
+autoTradeToggle.addEventListener('change', function() {
+    setAutoTrade(this.checked);
 });
+
+// ---------- Retrain model ----------
+retrainBtn.addEventListener('click', async function() {
+    retrainStatus.textContent = '⏳ Retraining...';
+    retrainBtn.disabled = true;
+    try {
+        const resp = await fetch('/api/retrain', { method: 'POST' });
+        const data = await resp.json();
+        retrainStatus.textContent = data.success ? '✅ Done' : '❌ Failed';
+    } catch (err) {
+        retrainStatus.textContent = '❌ Error';
+    } finally {
+        retrainBtn.disabled = false;
+        setTimeout(() => { retrainStatus.textContent = ''; }, 5000);
+    }
+});
+
+// ---------- Refresh ----------
+refreshBtn.addEventListener('click', fetchSignals);
+
+// ---------- Load initial signals ----------
+fetchSignals();
+
+// Also fetch auto‑trade status on load
+(async function getAutoTradeStatus() {
+    try {
+        const resp = await fetch('/api/auto_trade_status');
+        const data = await resp.json();
+        autoTradeToggle.checked = data.enabled;
+        autoTradeStatus.textContent = data.enabled ? 'Enabled' : 'Disabled';
+    } catch (_) { /* ignore */ }
+})();

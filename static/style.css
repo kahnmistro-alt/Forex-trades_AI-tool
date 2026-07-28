@@ -292,3 +292,34 @@ body {
 .toggle-switch input:checked+.slider:before {
     transform: translateX(22px);
 }
+
+
+/* NEW: Ready / Not ready icons */
+
+.ready-icon {
+    font-size: 1.2rem;
+}
+
+.ready-icon.true {
+    color: var(--accent-green);
+}
+
+.ready-icon.false {
+    color: var(--accent-red);
+}
+
+
+/* NEW: Disabled trade button with tooltip */
+
+.trade-btn:disabled {
+    cursor: not-allowed;
+    opacity: 0.6;
+}
+
+.trade-btn:disabled:hover {
+    opacity: 0.6;
+}
+
+.trade-btn:not(:disabled):hover {
+    opacity: 0.85;
+}

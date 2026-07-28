@@ -1,4 +1,4 @@
-# app.py – CNN-only signal generation (no rule, no SVM/HMM)
+# app.py – Lightweight SVM+HMM signal generation (no CNN)
 import os
 import json
 import time
@@ -31,7 +31,9 @@ app = Flask(__name__)
 # ---------- Parameters ----------
 RISK_ATR = 1.0
 MIN_CONFIDENCE = 0.7
-REWARD_RATIO = 3.0
+REWARD_RATIO = 1.5                     # 1:1.5 ratio (SL:TP)
+RISK_PER_TRADE = 0.01
+BALANCE = 10000.0
 ALL_PAIRS = ['EURUSD', 'GBPUSD', 'AUDUSD', 'USDCAD', 'USDCHF',
              'EURGBP', 'EURJPY', 'NZDUSD', 'GBPJPY', 'USDJPY']
 AUTO_TRADE_PAIRS = ALL_PAIRS
@@ -40,6 +42,11 @@ PYTRADER_SERVER = os.environ.get('PYTRADER_SERVER', 'localhost')
 PYTRADER_PORT = int(os.environ.get('PYTRADER_PORT', 1122))
 PYTRADER_AUTH_CODE = os.environ.get('PYTRADER_AUTH_CODE', 'None')
 TRADE_VOLUME = float(os.environ.get('TRADE_VOLUME', 0.01))
+BALANCE = float(os.environ.get('BALANCE', BALANCE))
+
+# ---------- Fixed volume & fixed dollar profit ----------
+FIXED_VOLUME = 1.0                     # always trade 1 lot
+TARGET_PROFIT_DOLLARS = 100.0          # profit target
 
 # ---------- Twelve Data ----------
 TWELVE_DATA_API_KEY = os.environ.get('TWELVE_DATA_API_KEY')
@@ -149,7 +156,7 @@ auto_trade_thread = None
 auto_trade_lock = threading.Lock()
 auto_trade_pairs = AUTO_TRADE_PAIRS
 
-# ---------- ML Model (CNN only) ----------
+# ---------- ML Model (SVM+HMM) ----------
 class SupabaseClientWrapper:
     def __init__(self, supabase_url, service_key):
         self.base_url = supabase_url
@@ -172,6 +179,10 @@ class TableWrapper:
         self.select_fields = fields
         return self
 
+    def eq(self, column, value):
+        self.filters[column] = value
+        return self
+
     def order(self, column, desc=False):
         self.order_by = column
         self.order_desc = desc
@@ -186,6 +197,8 @@ class TableWrapper:
         params = {}
         if self.select_fields != '*':
             params['select'] = self.select_fields
+        for col, val in self.filters.items():
+            params[col] = f'eq.{val}'
         if self.order_by:
             params['order'] = f'{self.order_by}.desc' if self.order_desc else f'{self.order_by}.asc'
         if self.limit_val:
@@ -217,6 +230,41 @@ class TableWrapper:
         }
         try:
             resp = requests.post(url, json=data, headers=headers)
+            if resp.status_code in (200, 201):
+                try:
+                    json_data = resp.json()
+                except:
+                    json_data = []
+                class Response:
+                    def __init__(self, data):
+                        self.data = data
+                return Response(json_data)
+            else:
+                class Response:
+                    def __init__(self):
+                        self.data = []
+                return Response()
+        except Exception as e:
+            class Response:
+                def __init__(self):
+                    self.data = []
+            return Response()
+
+    def update(self, data):
+        url = self.client.base_url + self.table_name
+        params = {}
+        for col, val in self.filters.items():
+            params[col] = f'eq.{val}'
+        if params:
+            url += '?' + '&'.join(f'{k}={v}' for k, v in params.items())
+        headers = {
+            "apikey": self.client.key,
+            "Authorization": f"Bearer {self.client.key}",
+            "Content-Type": "application/json",
+            "Prefer": "return=representation"
+        }
+        try:
+            resp = requests.patch(url, json=data, headers=headers)
             if resp.status_code in (200, 201):
                 try:
                     json_data = resp.json()
@@ -300,6 +348,22 @@ def get_live_entry_price(pair, signal):
         print(f"⚠️ PyTrader error for {pair}: {e}")
     return None, False
 
+def get_live_bid_ask(pair):
+    """Return (bid, ask) or (None, None) if not available."""
+    global pytrader, pytrader_connected
+    if not pytrader_connected:
+        if not connect_to_mt4():
+            return None, None
+    if pair not in pytrader.instrument_conversion_list:
+        pytrader.instrument_conversion_list[pair] = pair
+    try:
+        quote = pytrader.Get_last_ask_bid(pair)
+        if quote is not None:
+            return quote['bid'], quote['ask']
+    except Exception as e:
+        print(f"⚠️ PyTrader bid/ask error for {pair}: {e}")
+    return None, None
+
 # ---------- Volume & SL/TP ----------
 def get_valid_lot_size(pair, requested_volume):
     global pytrader, pytrader_connected
@@ -321,7 +385,7 @@ def get_valid_lot_size(pair, requested_volume):
         valid_vol = min_lot
     return valid_vol
 
-def adjust_sl_tp(pair, price, sl, tp):
+def adjust_sl_tp(pair, price, sl, tp, ratio=REWARD_RATIO):
     global pytrader, pytrader_connected
     if not pytrader_connected:
         if not connect_to_mt4():
@@ -340,27 +404,24 @@ def adjust_sl_tp(pair, price, sl, tp):
     tp = round(tp, digits)
     point = 10 ** -digits
     min_dist = max(stop_level * point, 50 * point)
+
     if sl < price:  # BUY
         if price - sl < min_dist:
             sl = price - min_dist
-        if tp < price or tp - price < min_dist:
-            tp = price + min_dist * 3
+        sl_distance = price - sl
+        min_tp_distance = max(sl_distance * ratio, min_dist)
+        if tp < price + min_tp_distance:
+            tp = price + min_tp_distance
     else:  # SELL
         if sl - price < min_dist:
             sl = price + min_dist
-        if tp > price or price - tp < min_dist:
-            tp = price - min_dist * 3
+        sl_distance = sl - price
+        min_tp_distance = max(sl_distance * ratio, min_dist)
+        if tp > price - min_tp_distance:
+            tp = price - min_tp_distance
+
     sl = round(sl, digits)
     tp = round(tp, digits)
-    if not ((sl < price and tp > price) or (sl > price and tp < price)):
-        if sl < price:
-            sl = price - min_dist
-            tp = price + min_dist * 3
-        else:
-            sl = price + min_dist
-            tp = price - min_dist * 3
-        sl = round(sl, digits)
-        tp = round(tp, digits)
     return sl, tp
 
 def validate_sl_tp(pair, price, sl, tp):
@@ -395,6 +456,20 @@ def validate_sl_tp(pair, price, sl, tp):
     else:
         return False, "SL and TP on same side of price"
     return True, "OK"
+
+# ---------- Position Sizing (kept for compatibility) ----------
+def compute_volume(pair, entry, sl, balance=BALANCE, risk_per_trade=RISK_PER_TRADE):
+    if pair.endswith('JPY'):
+        pip_size = 0.01
+    else:
+        pip_size = 0.0001
+    sl_pips = abs(entry - sl) / pip_size
+    if sl_pips <= 0:
+        return TRADE_VOLUME
+    pip_value = get_pip_value(pair, volume=1.0)
+    risk_amount = balance * risk_per_trade
+    volume = risk_amount / (sl_pips * pip_value)
+    return get_valid_lot_size(pair, volume)
 
 # ---------- Supabase Helpers ----------
 def table_exists(table_name):
@@ -459,7 +534,7 @@ def get_min_confidence():
 def update_min_confidence(new_val):
     supabase_request('PATCH', 'config?key=eq.min_confidence', {'value': new_val})
 
-def log_trade(pair, signal, price, tp, sl, result, pnl, source='cnn', ml_conf=0.0, rule_conf=0.0):
+def log_trade(pair, signal, price, tp, sl, result, pnl, source='svm_hmm', ml_conf=0.0, rule_conf=0.0):
     data = {
         'pair': pair,
         'signal': signal,
@@ -707,11 +782,11 @@ def compute_profit(entry, exit_price, pair, volume):
     profit = pips * 10.0 * volume
     return profit
 
-# ---------- Model Retraining ----------
+# ---------- Model Retraining (Full retrain from January 1) ----------
 _retraining_lock = threading.Lock()
 _retraining_thread = None
 _auto_retrain_enabled = True
-_RETRAIN_INTERVAL_HOURS = 6
+_RETRAIN_INTERVAL_HOURS = 24   # once per day
 _RETRAIN_PAIRS = [
     'EURUSD=X', 'GBPUSD=X', 'AUDUSD=X', 'USDCAD=X',
     'USDCHF=X', 'EURGBP=X', 'EURJPY=X', 'NZDUSD=X',
@@ -720,17 +795,23 @@ _RETRAIN_PAIRS = [
 
 def retrain_model():
     with _retraining_lock:
-        print("🔄 Starting model retraining (CNN only)...")
+        print("🔄 Starting model training (full retrain from year-to-date)...")
         try:
-            all_dfs = []
             now = datetime.now()
-            start_of_year = datetime(now.year, 1, 1)
+            start_of_year = datetime(now.year, 1, 1).strftime('%Y-%m-%d')
+            end = now.strftime('%Y-%m-%d')
+            print(f"📅 Training period: {start_of_year} to {end}")
+            all_dfs = []
 
-            macro_df = fetch_macro_data(start_of_year.strftime('%Y-%m-%d'), now.strftime('%Y-%m-%d'))
-            commodity_df = fetch_commodity_data(start_of_year.strftime('%Y-%m-%d'), now.strftime('%Y-%m-%d'))
+            macro_df = fetch_macro_data(start_of_year, end)
+            if macro_df.empty:
+                print("⚠️ Macro data empty, trying to fetch anyway...")
+            commodity_df = fetch_commodity_data(start_of_year, end)
+            if commodity_df.empty:
+                print("⚠️ Commodity data empty, trying to fetch anyway...")
 
             for pair in _RETRAIN_PAIRS:
-                df = fetch_data(pair, start_of_year.strftime('%Y-%m-%d'), now.strftime('%Y-%m-%d'), '1h')
+                df = fetch_data(pair, start_of_year, end, '1h')
                 if not df.empty:
                     df = df.reset_index()
                     df.rename(columns={df.columns[0]: 'Date'}, inplace=True)
@@ -753,7 +834,7 @@ def retrain_model():
                     all_dfs.append(df)
 
             if not all_dfs:
-                print("❌ No data for retraining.")
+                print("❌ No data for training.")
                 return False
 
             combined = pd.concat(all_dfs, ignore_index=True)
@@ -762,14 +843,19 @@ def retrain_model():
             if 'index' in combined.columns:
                 combined = combined.drop(columns=['index'])
 
+            X, _, _, _ = pattern_model.prepare_features(combined)
+            if X is None or len(X) < 60:
+                print("⚠️ Not enough data for training, skipping.")
+                return False
+
             success = pattern_model.train(combined)
             if success:
-                print("✅ CNN model retrained successfully.")
+                print("✅ SVM+HMM model trained successfully from year-to-date data.")
             else:
-                print("❌ Retraining failed.")
+                print("❌ Training failed.")
             return success
         except Exception as e:
-            print(f"❌ Retraining error: {e}")
+            print(f"❌ Training error: {e}")
             traceback.print_exc()
             return False
 
@@ -784,18 +870,70 @@ def start_auto_retrain_thread():
     if _retraining_thread is None or not _retraining_thread.is_alive():
         _retraining_thread = threading.Thread(target=auto_retrain_loop, daemon=True)
         _retraining_thread.start()
-        print("🚀 Auto‑retrain thread started.")
+        print("🚀 Auto‑retrain thread started (once per day, full YTD retrain).")
 
-# ---------- Signal Computation (CNN only) ----------
-def compute_tp_sl(price, atr, signal, risk_atr=RISK_ATR, reward_ratio=REWARD_RATIO):
-    risk = atr * risk_atr
-    if signal == 'BUY':
-        sl = price - risk
-        tp = price + risk * reward_ratio
+# ---------- Fixed profit / fixed volume SL/TP computation (1:1.5 ratio) ----------
+def compute_tp_sl(price, pair, signal, volume=FIXED_VOLUME,
+                  target_profit=TARGET_PROFIT_DOLLARS,
+                  ratio=REWARD_RATIO):
+    """
+    Compute SL and TP prices for a given ratio and fixed profit target.
+    TP distance is set to achieve the target profit with fixed volume.
+    SL distance = TP distance / ratio.
+    """
+    pip_value = get_pip_value(pair, volume=1.0)
+    if pair.endswith('JPY'):
+        pip_size = 0.01
     else:
-        sl = price + risk
-        tp = price - risk * reward_ratio
+        pip_size = 0.0001
+
+    # Distance (in price units) needed for target profit
+    tp_pips = target_profit / (pip_value * volume)
+    tp_distance = tp_pips * pip_size
+
+    # SL distance = TP / ratio
+    sl_distance = tp_distance / ratio
+
+    if signal == 'BUY':
+        sl = price - sl_distance
+        tp = price + tp_distance
+    else:  # SELL
+        sl = price + sl_distance
+        tp = price - tp_distance
+
     return sl, tp
+
+# ---------- Trade Readiness Check ----------
+def is_trade_ready(pair, price, signal, atr, df,
+                   spread_threshold=0.0002,
+                   max_price_dev=0.005,
+                   min_atr_ratio=0.3,
+                   max_atr_ratio=3.0,
+                   lookback=20):
+    bid, ask = get_live_bid_ask(pair)
+    if bid is not None and ask is not None:
+        current_spread = ask - bid
+        if current_spread > spread_threshold:
+            return False, f"Spread too wide: {current_spread:.5f}"
+
+    if len(df) > 0:
+        last_close = df['close'].iloc[-1]
+        if last_close != 0:
+            dev = abs(price - last_close) / last_close
+            if dev > max_price_dev:
+                return False, f"Price deviated {dev:.3%} > {max_price_dev:.3%}"
+
+    if 'atr' not in df.columns:
+        return False, "ATR column missing in DataFrame"
+    atr_series = df['atr'].dropna()
+    if len(atr_series) >= lookback:
+        avg_atr = atr_series.iloc[-lookback:].mean()
+        if avg_atr > 0:
+            ratio = atr / avg_atr
+            if ratio < min_atr_ratio or ratio > max_atr_ratio:
+                return False, f"ATR ratio {ratio:.2f} outside [{min_atr_ratio}, {max_atr_ratio}]"
+
+    return True, "Ready"
 
 def process_pair(pair, interval, atr_period, risk_mult, reward_ratio):
     recent_start, recent_end = get_date_ranges()
@@ -827,10 +965,10 @@ def process_pair(pair, interval, atr_period, risk_mult, reward_ratio):
         if df.empty:
             return None
 
-        # CNN signal
         signal, conf = pattern_model.predict_pattern(df)
-        min_conf = get_min_confidence()
+        print(f"🔍 {pair} raw confidence: {conf:.4f}")
 
+        min_conf = get_min_confidence()
         if conf < min_conf:
             signal = 'HOLD'
             conf = 0.0
@@ -842,10 +980,13 @@ def process_pair(pair, interval, atr_period, risk_mult, reward_ratio):
         else:
             reference_price = df['close'].iloc[-1]
 
+        # Compute SL/TP using fixed volume and 1:1.5 ratio
         if signal != 'HOLD':
-            raw_sl, raw_tp = compute_tp_sl(reference_price, current_atr, signal,
-                                           risk_atr=risk_mult, reward_ratio=reward_ratio)
-            adjusted_sl, adjusted_tp = adjust_sl_tp(pair, reference_price, raw_sl, raw_tp)
+            raw_sl, raw_tp = compute_tp_sl(reference_price, pair, signal,
+                                           volume=FIXED_VOLUME,
+                                           target_profit=TARGET_PROFIT_DOLLARS,
+                                           ratio=REWARD_RATIO)
+            adjusted_sl, adjusted_tp = adjust_sl_tp(pair, reference_price, raw_sl, raw_tp, ratio=REWARD_RATIO)
             if adjusted_sl is None or adjusted_tp is None:
                 can_trade = False
                 reason = "Cannot adjust SL/TP to valid levels"
@@ -858,12 +999,16 @@ def process_pair(pair, interval, atr_period, risk_mult, reward_ratio):
             reason = "No signal"
             sl, tp = None, None
 
-        volume_for_profit = TRADE_VOLUME
+        volume_for_profit = FIXED_VOLUME
         tp_profit = None
         sl_loss = None
         if signal != 'HOLD' and can_trade and sl is not None and tp is not None:
             tp_profit = compute_profit(reference_price, tp, pair, volume_for_profit)
             sl_loss = compute_profit(reference_price, sl, pair, volume_for_profit)
+
+        ready, ready_reason = False, "Not applicable"
+        if signal != 'HOLD' and can_trade:
+            ready, ready_reason = is_trade_ready(pair, reference_price, signal, current_atr, df)
 
         chart_data = {
             "dates": [str(d) for d in df.index[-100:]],
@@ -885,10 +1030,12 @@ def process_pair(pair, interval, atr_period, risk_mult, reward_ratio):
             "atr": round(current_atr, 5),
             "can_trade": can_trade,
             "can_trade_reason": reason,
+            "trade_ready": ready,
+            "trade_ready_reason": ready_reason,
             "chart": chart_data,
             "tp_profit": round(tp_profit, 2) if tp_profit is not None else None,
             "sl_loss": round(sl_loss, 2) if sl_loss is not None else None,
-            "source": "cnn",
+            "source": "svm_hmm",
             "ml_conf": round(conf, 3),
             "rule_conf": 0.0,
             "error": None
@@ -898,7 +1045,7 @@ def process_pair(pair, interval, atr_period, risk_mult, reward_ratio):
         traceback.print_exc()
         return {"pair": pair, "error": str(e)[:100]}
 
-# ---------- Trade Execution ----------
+# ---------- Trade Execution (fixed volume) ----------
 def execute_trade(pair, signal, price, tp, sl, volume=TRADE_VOLUME):
     global pytrader, pytrader_connected
     if not PYTRADER_AVAILABLE:
@@ -908,13 +1055,23 @@ def execute_trade(pair, signal, price, tp, sl, volume=TRADE_VOLUME):
             return {"success": False, "error": "Could not connect to MT4"}
     if pair not in pytrader.instrument_conversion_list:
         pytrader.instrument_conversion_list[pair] = pair
+
+    # Override volume with fixed volume
+    volume = FIXED_VOLUME
+    adjusted_volume = get_valid_lot_size(pair, volume)
+
     live_price, live_ok = get_live_entry_price(pair, signal)
     if not live_ok:
         ref_price = price
     else:
         ref_price = live_price
-    adjusted_volume = get_valid_lot_size(pair, volume)
-    adjusted_sl, adjusted_tp = adjust_sl_tp(pair, ref_price, sl, tp)
+
+    # Re‑compute SL/TP with fixed volume & 1:1.5 ratio
+    raw_sl, raw_tp = compute_tp_sl(ref_price, pair, signal,
+                                   volume=FIXED_VOLUME,
+                                   target_profit=TARGET_PROFIT_DOLLARS,
+                                   ratio=REWARD_RATIO)
+    adjusted_sl, adjusted_tp = adjust_sl_tp(pair, ref_price, raw_sl, raw_tp, ratio=REWARD_RATIO)
     if adjusted_sl is None or adjusted_tp is None:
         return {"success": False, "error": "Invalid SL/TP after adjustment"}
     valid, reason = validate_sl_tp(pair, ref_price, adjusted_sl, adjusted_tp)
@@ -931,7 +1088,7 @@ def execute_trade(pair, signal, price, tp, sl, volume=TRADE_VOLUME):
             magicnumber=0,
             stoploss=adjusted_sl,
             takeprofit=adjusted_tp,
-            comment="CNN",
+            comment="SVM_HMM",
             market=False
         )
         if ticket == -1:
@@ -940,12 +1097,19 @@ def execute_trade(pair, signal, price, tp, sl, volume=TRADE_VOLUME):
         return {
             "success": True,
             "order_id": ticket,
-            "message": f"{signal} {pair} executed, ticket {ticket}"
+            "message": f"{signal} {pair} executed, ticket {ticket}",
+            "volume": adjusted_volume
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 # ---------- Auto-Trade ----------
+def has_pending_trade(pair):
+    ok, rows = supabase_request('GET', f'trades?pair=eq.{pair}&result=eq.pending')
+    if ok and rows:
+        return len(rows) > 0
+    return False
+
 def auto_trade_iteration():
     if not auto_trade_enabled:
         return
@@ -954,12 +1118,21 @@ def auto_trade_iteration():
     atr_period = 14
     risk_mult = RISK_ATR
     reward_ratio = REWARD_RATIO
-    volume = TRADE_VOLUME
+    volume = FIXED_VOLUME
     pairs = auto_trade_pairs
     for pair in pairs:
         yf_pair = pair if '=X' in pair else pair + '=X'
         res = process_pair(yf_pair, interval, atr_period, risk_mult, reward_ratio)
-        if res and res.get('signal') in ('BUY', 'SELL') and res.get('can_trade'):
+        if res and res.get('signal') in ('BUY', 'SELL'):
+            if not res.get('can_trade', False):
+                print(f"[Auto-Trade] ⏳ {pair} signal exists but can_trade=False: {res.get('can_trade_reason')}")
+                continue
+            if not res.get('trade_ready', False):
+                print(f"[Auto-Trade] ⏳ {pair} signal ready but timing not perfect: {res.get('trade_ready_reason')}")
+                continue
+            if has_pending_trade(pair):
+                print(f"[Auto-Trade] ⏭️ {pair} already has a pending trade – skipping")
+                continue
             trade_res = execute_trade(
                 pair=res['pair'],
                 signal=res['signal'],
@@ -972,7 +1145,7 @@ def auto_trade_iteration():
                 log_trade(
                     res['pair'], res['signal'], res['price'],
                     res['tp'], res['sl'], 'pending', 0.0,
-                    source='cnn',
+                    source='svm_hmm',
                     ml_conf=res.get('ml_conf', 0.0),
                     rule_conf=0.0
                 )
@@ -984,14 +1157,14 @@ def auto_trade_loop():
     while True:
         if auto_trade_enabled:
             auto_trade_iteration()
-        time.sleep(60)
+        time.sleep(30)
 
 def start_auto_trade_thread():
     global auto_trade_thread
     if auto_trade_thread is None or not auto_trade_thread.is_alive():
         auto_trade_thread = threading.Thread(target=auto_trade_loop, daemon=True)
         auto_trade_thread.start()
-        print("🚀 Auto-trade thread started (runs every 60s).")
+        print("🚀 Auto-trade thread started (runs every 30s).")
 
 # ---------- Flask Routes ----------
 @app.route('/')
@@ -1032,7 +1205,7 @@ def auto_trade():
     for pair in pair_list:
         res = process_pair(pair, interval, atr_period, risk_mult, reward_ratio)
         if res:
-            if res['signal'] in ('BUY', 'SELL') and res.get('can_trade', False):
+            if res['signal'] in ('BUY', 'SELL') and res.get('can_trade', False) and res.get('trade_ready', False):
                 trade_res = execute_trade(
                     pair=res['pair'],
                     signal=res['signal'],
@@ -1046,12 +1219,12 @@ def auto_trade():
                     log_trade(
                         res['pair'], res['signal'], res['price'],
                         res['tp'], res['sl'], 'pending', 0.0,
-                        source='cnn',
+                        source='svm_hmm',
                         ml_conf=res.get('ml_conf', 0.0),
                         rule_conf=0.0
                     )
             else:
-                res['trade'] = {"success": False, "error": "No valid signal or invalid SL/TP"}
+                res['trade'] = {"success": False, "error": "No valid signal, invalid SL/TP, or timing not ready"}
             results.append(res)
     return jsonify(results)
 
@@ -1110,7 +1283,8 @@ def retrain_endpoint():
 if __name__ == '__main__':
     init_db()
     print(f"✅ Database ready. Min confidence: {get_min_confidence()}")
-    print("🔧 Signal mode: CNN-LSTM hybrid (no rule, no SVM/HMM)")
+    print("🔧 Signal mode: SVM+HMM hybrid (lightweight)")
+    print(f"📊 Fixed volume: {FIXED_VOLUME} lot, target ${TARGET_PROFIT_DOLLARS} profit, 1:1.5 ratio (SL:TP)")
     if PYTRADER_AVAILABLE:
         connect_to_mt4()
     if TWELVE_DATA_API_KEY:
